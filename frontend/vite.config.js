@@ -103,6 +103,14 @@ export default defineConfig({
         target: 'http://localhost:5409',
         changeOrigin: true,
       },
+      '/ai/task': {
+        target: 'http://localhost:8888',
+        changeOrigin: true,
+      },
+      '/storage': {
+        target: 'http://localhost:8888',
+        changeOrigin: true,
+      },
     }
   },
   build: {

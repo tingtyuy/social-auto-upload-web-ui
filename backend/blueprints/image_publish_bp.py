@@ -82,18 +82,25 @@ def publish_images():
     import asyncio
     from impl.registry import get_platform
 
+    logger.info("[image_publish] 收到发布请求")
     data = request.get_json()
     if not data:
+        logger.error("[image_publish] 请求数据为空")
         return jsonify({"code": 400, "msg": "请求数据不能为空"}), 400
+    logger.info(f"[image_publish] 请求数据 keys: {list(data.keys())}")
 
     image_ids = data.get('image_ids', [])
     config = data.get('account_configs')
     batch_id = data.get('batchId') or str(uuid.uuid4())
     detail_id = str(uuid.uuid4())
 
+    logger.info(f"[image_publish] image_ids={image_ids}, config_keys={list(config.keys()) if config else 'None'}")
+
     if not config or not isinstance(config, dict):
+        logger.error(f"[image_publish] config 无效: {type(config)}")
         return jsonify({"code": 400, "msg": "account_configs 必须是单个账号配置 dict"}), 400
     if not image_ids and not config.get('filePath'):
+        logger.error(f"[image_publish] 缺少 image_ids 和 filePath")
         return jsonify({"code": 400, "msg": "缺少 image_ids 或 filePath"}), 400
 
     now = datetime.now().isoformat()
@@ -115,6 +122,7 @@ def publish_images():
 
     try:
         conn = _get_db()
+        logger.info(f"[image_publish] 写入数据库: batch_id={batch_id}, detail_id={detail_id}")
         conn.execute(
             """INSERT OR IGNORE INTO publish_batches
                (id, type, title, description, image_material_ids,
@@ -136,7 +144,9 @@ def publish_images():
         )
         conn.commit()
         conn.close()
+        logger.info(f"[image_publish] 数据库写入成功")
     except Exception as e:
+        logger.error(f"[image_publish] 数据库写入失败: {e}", exc_info=True)
         return jsonify({"code": 500, "msg": f"写入失败: {e}"}), 500
 
     # ---------- 实际发布执行（保留原有逻辑） ----------
@@ -164,6 +174,8 @@ def publish_images():
         platform_type = config.get('platform')
         cookie_file = config.get('filePath')
 
+        logger.info(f"[image_publish] platform_type={platform_type}, cookie_file={cookie_file}, image_files_count={len(image_files)}")
+
         if image_files and platform_type and cookie_file:
             # 平台类型映射（支持中文名称和英文key）
             platform_map = {
@@ -177,11 +189,14 @@ def publish_images():
                 'alipay': 12, '支付宝': 12,  # 图集发布
             }
             platform_id = platform_map.get(platform_type)
+            logger.info(f"[image_publish] platform_type={platform_type} -> platform_id={platform_id}")
             if not platform_id:
+                logger.error(f"[image_publish] 不支持的平台: {platform_type}")
                 raise ValueError(f"不支持的平台: {platform_type}")
 
             platform_obj = get_platform(platform_id)
             if not platform_obj:
+                logger.error(f"[image_publish] 无法获取平台实例: platform_id={platform_id}")
                 raise ValueError("无法获取平台实例")
 
             dry_run = config.get('dry_run', True)
@@ -196,6 +211,7 @@ def publish_images():
 
             # 调用平台的 publish_image 方法
             publish_fn = platform_obj.publish_image
+            logger.info(f"[image_publish] 准备调用平台发布: platform_id={platform_id}, publish_fn={publish_fn}")
             publish_kwargs = dict(
                 title=config.get('title', ''),
                 files=image_files,
@@ -221,17 +237,24 @@ def publish_images():
                 dry_run=dry_run,
             )
             if asyncio.iscoroutinefunction(publish_fn):
+                logger.info(f"[image_publish] 调用异步发布函数...")
                 result = asyncio.run(publish_fn(**publish_kwargs))
             else:
+                logger.info(f"[image_publish] 调用同步发布函数...")
                 result = publish_fn(**publish_kwargs)
+            logger.info(f"[image_publish] 发布结果: {result}")
             success = bool(result)
         else:
             # 没有图片或缺配置：不调用平台（保留成功占位以便 batch 不卡 pending）
-            err = "无图片或缺平台/cookie 配置，跳过实际发布"
-            logger.info(f"[image_publish] {err}")
+            missing = []
+            if not image_files: missing.append("image_files")
+            if not platform_type: missing.append("platform")
+            if not cookie_file: missing.append("filePath")
+            err = f"跳过实际发布: 缺少 {', '.join(missing)}"
+            logger.warning(f"[image_publish] {err}")
             success = True
     except Exception as e:
-        logger.error(f"发布失败: {e}")
+        logger.error(f"[image_publish] 发布失败: {e}", exc_info=True)
         err = str(e)
         success = False
 

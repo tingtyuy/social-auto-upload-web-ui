@@ -112,6 +112,13 @@ const { form, hasAccountOverride, resetOverride, publicApi } = useChannelForm(
   },
 )
 
+// Auto-fill title from description (first 16 chars)
+watch(() => form.description, (val) => {
+  if (val && !form.title) {
+    form.title = val.slice(0, 16)
+  }
+})
+
 // 关键:form.title 始终 = form.description(让 publishAll 的 !merged.title 校验通过)
 watch(() => form.description, (v) => { form.title = v || '' })
 

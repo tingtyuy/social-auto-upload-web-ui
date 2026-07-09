@@ -58,7 +58,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAccountStore } from '@/stores/account'
 import { imagePublishApi } from '@/api/imagePublish'
@@ -139,6 +139,13 @@ const { form, hasAccountOverride, resetOverride, publicApi } = useChannelForm(
     },
   },
 )
+
+// Auto-fill title from description (first 16 chars)
+watch(() => form.description, (val) => {
+  if (val && !form.title) {
+    form.title = val.slice(0, 16)
+  }
+})
 
 // ===== Tag input =====
 const tagInput = ref('')

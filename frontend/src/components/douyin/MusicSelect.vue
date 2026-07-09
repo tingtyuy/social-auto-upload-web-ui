@@ -2,7 +2,7 @@
   <div class="music-select">
     <el-select
       v-model="selectedMusicId"
-      placeholder="搜索音乐"
+      placeholder="选择音乐"
       clearable
       filterable
       no-data-text=" "
@@ -28,6 +28,27 @@
           <span>加载中...</span>
         </div>
       </template>
+
+      <!-- Fixed options (no search needed) -->
+      <div class="fixed-music-label">常用音乐（无需搜索）</div>
+      <el-option
+        v-for="music in fixedMusicList"
+        :key="music.title"
+        :label="music.title"
+        :value="music.title"
+      >
+        <div class="music-option">
+          <div class="music-info">
+            <div class="music-title">{{ music.title }}</div>
+            <div class="music-meta">
+              <span class="music-author">{{ music.author }}</span>
+            </div>
+          </div>
+        </div>
+      </el-option>
+
+      <!-- Search results -->
+      <div v-if="musicList.length > 0" class="fixed-music-label">搜索结果</div>
       <el-option
         v-for="music in musicList"
         :key="music.id"
@@ -82,11 +103,18 @@ const musicList = ref([])
 const selectedMusicId = ref(props.modelValue || '')
 const searchKeyword = ref('')
 
+// Fixed frequently used music list
+const fixedMusicList = ref([
+  { title: '默认原声', author: '系统' },
+  { title: '轻快背景音乐', author: '推荐' },
+  { title: '热门BGM', author: '推荐' },
+  { title: '温柔纯音乐', author: '推荐' },
+  { title: '节奏感强', author: '推荐' },
+])
+
 watch(() => props.modelValue, (val) => {
   selectedMusicId.value = val || ''
-  // 如果有值但 musicList 中没有对应的选项，添加一个占位项
-  if (val && !musicList.value.find(m => m.title === val)) {
-    // 使用完整对象或创建占位项
+  if (val && !musicList.value.find(m => m.title === val) && !fixedMusicList.value.find(m => m.title === val)) {
     if (props.data && props.data.title === val) {
       musicList.value.unshift(props.data)
     } else {
@@ -108,14 +136,11 @@ async function handleSearch() {
     return
   }
 
-  console.log('触发音乐搜索:', keyword)
   loading.value = true
   try {
     const resp = await douyinImageApi.searchMusic(props.accountId || '', keyword)
-    console.log('音乐搜索结果:', resp)
     if (resp.code === 200) {
       musicList.value = resp.data?.music || []
-      console.log('音乐列表:', musicList.value)
     }
   } catch (e) {
     console.error('搜索音乐失败:', e)
@@ -131,7 +156,7 @@ function handleClear() {
 
 function handleChange(val) {
   if (val) {
-    const music = musicList.value.find(m => m.title === val)
+    const music = musicList.value.find(m => m.title === val) || fixedMusicList.value.find(m => m.title === val)
     emit('update:modelValue', val)
     emit('change', {
       ...music,
@@ -188,12 +213,21 @@ function onImageError(e) {
   }
 
   @keyframes rotating {
-    from {
-      transform: rotate(0deg);
-    }
-    to {
-      transform: rotate(360deg);
-    }
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+}
+
+.fixed-music-label {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #94A3B8;
+  background: #1e293b;
+  border-top: 1px solid #334155;
+  cursor: default;
+
+  &:first-child {
+    border-top: none;
   }
 }
 

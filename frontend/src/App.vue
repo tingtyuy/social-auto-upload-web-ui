@@ -93,6 +93,7 @@ const navItems = [
   { path: '/material-management', icon: Picture, title: '素材管理' },
   { path: '/publish-center', icon: Upload, title: '视频发布' },
   { path: '/image-publish', icon: Picture, title: '图集发布' },
+  { path: '/new-image-publish', icon: Picture, title: '新图集发布' },
   { path: '/drafts', icon: Document, title: '草稿箱' },
   { path: '/publish-history', icon: Clock, title: '发布历史' },
   { path: '/changelog', icon: Notebook, title: '更新日志' },

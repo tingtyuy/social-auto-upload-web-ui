@@ -65,7 +65,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { WarningFilled } from '@element-plus/icons-vue'
 import { useAccountStore } from '@/stores/account'
@@ -126,6 +126,13 @@ const { form, hasAccountOverride, resetOverride, publicApi } = useChannelForm(
     },
   },
 )
+
+// Auto-fill title from description (first 16 chars)
+watch(() => form.description, (val) => {
+  if (val && !form.title) {
+    form.title = val.slice(0, 16)
+  }
+})
 
 const tagInput = ref('')
 
