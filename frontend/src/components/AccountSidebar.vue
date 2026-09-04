@@ -18,8 +18,12 @@
         :class="['group-wrap', { 'is-selected': selectedPlatform === group.key }]"
       >
         <div class="group-header cursor-pointer" @click="$emit('toggle-group', group.key)">
-          <el-icon class="expand-icon" :style="{ color: selectedPlatform === group.key ? group.color : '' }">
-            <component :is="expandedGroups.has(group.key) ? ArrowDown : ArrowRight" />
+          <el-icon
+            class="expand-icon"
+            :class="{ 'is-expanded': expandedGroups.has(group.key) }"
+            :style="{ color: selectedPlatform === group.key ? group.color : '' }"
+          >
+            <component :is="ArrowRight" />
           </el-icon>
           <span class="platform-badge">
             <img v-if="group.logo" :src="group.logo" :alt="group.name" class="platform-badge-img">
@@ -29,7 +33,11 @@
           <span class="group-count">{{ mode === 'readonly' ? group.accounts.length : group.accounts.filter(a => publishAccountIds.has(a.id)).length }}</span>
         </div>
 
-        <transition name="slide">
+        <transition
+          name="slide"
+          @enter="onSlideEnter"
+          @leave="onSlideLeave"
+        >
           <div v-show="expandedGroups.has(group.key)" class="group-accounts">
             <div
               v-for="account in group.accounts.filter(a => mode === 'readonly' ? true : publishAccountIds.has(a.id))"
@@ -63,7 +71,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { ArrowDown, ArrowRight, StarFilled, Close } from '@element-plus/icons-vue'
+import { ArrowRight, StarFilled, Close } from '@element-plus/icons-vue'
 import { useAppStore } from '@/stores/app'
 import { getDefaultAvatar, proxyAvatar } from '@/utils/avatar'
 
@@ -101,6 +109,17 @@ const visibleAccountGroups = computed(() =>
     return true
   })
 )
+
+// 展开/收起过渡:动态设置 max-height,避免硬编码上限导致内容被裁剪
+function onSlideEnter(el) {
+  el.style.maxHeight = el.scrollHeight + 'px'
+}
+function onSlideLeave(el) {
+  el.style.maxHeight = el.scrollHeight + 'px'
+  // 强制重排后再改为 0,确保 leave 动画能播放
+  void el.offsetHeight
+  el.style.maxHeight = '0px'
+}
 </script>
 
 <style lang="scss" scoped>
@@ -109,8 +128,8 @@ const visibleAccountGroups = computed(() =>
 .account-sidebar {
   width: 232px;
   flex-shrink: 0;
-  background: linear-gradient(180deg, #0d0d22 0%, #0a0a1a 100%);
-  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  background: linear-gradient(180deg, $bg-elevated 0%, $bg-base 100%);
+  border-right: 1px solid rgba($overlay-rgb, 0.06);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -130,7 +149,7 @@ const visibleAccountGroups = computed(() =>
     .sidebar-count {
       font-size: 11px;
       color: #a78bfa;
-      background: rgba(139, 92, 246, 0.12);
+      background: rgba($brand-start, 0.12);
       padding: 3px 10px;
       border-radius: 12px;
       font-weight: 700;
@@ -143,7 +162,7 @@ const visibleAccountGroups = computed(() =>
     padding: 4px 0;
 
     &::-webkit-scrollbar { width: 3px; }
-    &::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.15); border-radius: 2px; }
+    &::-webkit-scrollbar-thumb { background: rgba($brand-start, 0.15); border-radius: 2px; }
   }
 
   .group-wrap {
@@ -153,8 +172,8 @@ const visibleAccountGroups = computed(() =>
     border: 1px solid transparent;
 
     &.is-selected {
-      background: rgba(139, 92, 246, 0.1);
-      border-color: rgba(139, 92, 246, 0.2);
+      background: rgba($brand-start, 0.1);
+      border-color: rgba($brand-start, 0.2);
       margin: 2px 9px;
     }
   }
@@ -168,12 +187,18 @@ const visibleAccountGroups = computed(() =>
     transition: all 0.2s ease;
     user-select: none;
 
-    &:hover { background: rgba(255, 255, 255, 0.03); }
+    &:hover { background: rgba($overlay-rgb, 0.03); }
 
     .expand-icon {
       font-size: 12px;
       color: $text-muted;
-      transition: all 0.2s ease;
+      // 旋转动画:展开时 90°,收起时 0°,与下方 .group-accounts 的 slide 过渡协调
+      transform: rotate(0deg);
+      transition: transform 240ms cubic-bezier(0.4, 0, 0.2, 1), color 0.2s ease;
+
+      &.is-expanded {
+        transform: rotate(90deg);
+      }
     }
 
     .platform-badge {
@@ -210,7 +235,7 @@ const visibleAccountGroups = computed(() =>
     .group-count {
       font-size: 11px;
       color: #a78bfa;
-      background: rgba(139, 92, 246, 0.1);
+      background: rgba($brand-start, 0.1);
       padding: 2px 8px;
       border-radius: 8px;
       font-weight: 600;
@@ -244,36 +269,67 @@ const visibleAccountGroups = computed(() =>
   }
 
   .slide-enter-active, .slide-leave-active {
-    transition: all 200ms ease;
+    // max-height 由 JS 钩子动态设置,这里只负责 transition 曲线和 padding 过渡
+    transition: max-height 260ms cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 200ms ease,
+                padding 200ms ease;
     overflow: hidden;
   }
-  .slide-enter-from, .slide-leave-to { opacity: 0; max-height: 0; }
-  .slide-enter-to, .slide-leave-from { opacity: 1; max-height: 500px; }
+  .slide-enter-from, .slide-leave-to {
+    opacity: 0;
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+  .slide-enter-to, .slide-leave-from {
+    opacity: 1;
+    // max-height 由 onSlideEnter/onSlideLeave 动态写入实际 scrollHeight
+    padding-top: 0;
+    padding-bottom: 8px;
+  }
 
   .account-item {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 7px 8px;
+    // padding-left: 5px 抵消选中态左侧 3px 紫色色条,避免文字位置跳动
+    padding: 7px 8px 7px 5px;
     border-radius: 8px;
     transition: all 0.2s ease;
     border: 1px solid transparent;
 
     &:hover {
-      background: rgba(255, 255, 255, 0.04);
-      border-color: rgba(255, 255, 255, 0.04);
+      background: rgba($overlay-rgb, 0.04);
+      border-color: rgba($overlay-rgb, 0.04);
     }
 
     &.active {
-      background: rgba(139, 92, 246, 0.1);
-      border-color: rgba(139, 92, 246, 0.15);
+      // 选中态:加深紫色背景 + 紫色边框 + 左侧 3px 紫色色条,多重视觉锚点更醒目
+      background: rgba($brand-start, 0.22);
+      border-color: rgba($brand-start, 0.45);
+      box-shadow: inset 3px 0 0 0 $brand-start, 0 1px 4px rgba($brand-start, 0.15);
+
+      // 文字加深+加粗, 亮色模式从 text-secondary(#64748b) 提到 brand-start
+      // 在浅紫底上对比度足够, 不会再"发白"; 暗色模式仍清晰
+      .account-name {
+        color: $brand-start;
+        font-weight: 600;
+      }
+
+      // avatar 加紫色描边,呼应选中态
+      .account-avatar {
+        border-color: $brand-start;
+      }
+
+      // 状态点也点亮
+      .dot.on { box-shadow: 0 0 8px rgba($success-color, 0.7); }
     }
 
     .account-avatar {
       width: 24px;
       height: 24px;
       border-radius: 50%;
-      background: rgba(139, 92, 246, 0.15);
+      background: rgba($brand-start, 0.15);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -308,8 +364,8 @@ const visibleAccountGroups = computed(() =>
       border-radius: 50%;
       flex-shrink: 0;
 
-      &.on { background: $success-color; box-shadow: 0 0 6px rgba(34, 197, 94, 0.5); }
-      &.off { background: $danger-color; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+      &.on { background: $success-color; box-shadow: 0 0 6px rgba($success-color, 0.5); }
+      &.off { background: $danger-color; box-shadow: 0 0 6px rgba($danger-color, 0.5); }
     }
 
     .account-remove {
@@ -327,8 +383,8 @@ const visibleAccountGroups = computed(() =>
     &:hover .account-remove { opacity: 0.5; }
 
     &.has-override {
-      background: rgba(245, 158, 11, 0.06);
-      border-color: rgba(245, 158, 11, 0.1);
+      background: rgba($warning-color, 0.06);
+      border-color: rgba($warning-color, 0.1);
       .account-name { font-weight: 600; }
     }
 
@@ -341,10 +397,10 @@ const visibleAccountGroups = computed(() =>
 
   .sidebar-footer {
     padding: 12px 10px;
-    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    border-top: 1px solid rgba($overlay-rgb, 0.04);
 
     .add-btn {
-      border: 1.5px dashed rgba(139, 92, 246, 0.25);
+      border: 1.5px dashed rgba($brand-start, 0.25);
       border-radius: 10px;
       padding: 10px;
       text-align: center;
@@ -354,9 +410,9 @@ const visibleAccountGroups = computed(() =>
       transition: all 0.2s ease;
 
       &:hover {
-        border-color: rgba(139, 92, 246, 0.5);
+        border-color: rgba($brand-start, 0.5);
         color: #c4b5fd;
-        background: rgba(139, 92, 246, 0.08);
+        background: rgba($brand-start, 0.08);
       }
     }
   }

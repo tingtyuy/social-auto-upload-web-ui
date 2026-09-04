@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 import sys
+import json
 
 sys.path.insert(0, str(Path(__file__).parent))
 from conf import BASE_DIR
@@ -109,7 +110,10 @@ def init_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         started_at TIMESTAMP,
         finished_at TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        scheduled_at TEXT DEFAULT '',
+        interval_minutes REAL DEFAULT 0,
+        next_batch_id TEXT DEFAULT ''
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_publish_batches_created ON publish_batches(created_at DESC)")
@@ -267,6 +271,21 @@ def migrate_database():
     except sqlite3.OperationalError:
         pass  # 索引已存在
 
+    # 发布链调度：发布页批量发布时视频间隔用（DB 驱动的定时调度）
+    # scheduled_at = 该视频预定开始发布的时间（ISO，空 = 不等待/立即）
+    # interval_minutes = 本批次提交时的视频间隔（分钟）
+    # next_batch_id = 链表：本视频全部完成后按间隔排程下一个视频
+    for col_sql in (
+        "ALTER TABLE publish_batches ADD COLUMN scheduled_at TEXT DEFAULT ''",
+        "ALTER TABLE publish_batches ADD COLUMN interval_minutes REAL DEFAULT 0",
+        "ALTER TABLE publish_batches ADD COLUMN next_batch_id TEXT DEFAULT ''",
+    ):
+        try:
+            cursor.execute(col_sql)
+            logger.info(f"已添加 publish_batches.{col_sql.split('ADD COLUMN ')[1].split()[0]} 列")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
     # 确保 tags 表存在（幂等）
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tags (
@@ -285,6 +304,39 @@ def migrate_database():
             FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
         )
     """)
+
+    # user_info 扩展账号运营数据字段：粉丝数 / 获赞数 / 关注数
+    # 存量平台暂不同步(保持默认 0),后续版本按平台逐步同步进来
+    for col in ("fans", "likes", "follows"):
+        try:
+            cursor.execute(f'ALTER TABLE user_info ADD COLUMN {col} INTEGER DEFAULT 0')
+            logger.info(f"已添加 user_info.{col} 列")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
+    # user_info 升级:新增 stats JSON 列(账号运营数据列表,每条 {ICON, COUNT, NAME, SORT})
+    # 首次添加时,把 fans/likes/follows 非零的历史数据迁移进 stats
+    cursor.execute("PRAGMA table_info(user_info)")
+    user_info_cols = [row[1] for row in cursor.fetchall()]
+    if 'stats' not in user_info_cols:
+        cursor.execute('ALTER TABLE user_info ADD COLUMN stats TEXT DEFAULT "[]"')
+        logger.info('已添加 user_info.stats 列')
+        # 一次性数据迁移:把非零的 fans/likes/follows 写入 stats JSON
+        try:
+            cursor.execute('SELECT id, fans, likes, follows FROM user_info')
+            for row in cursor.fetchall():
+                acc_id, f, l, fo = row[0], row[1] or 0, row[2] or 0, row[3] or 0
+                if f == 0 and l == 0 and fo == 0:
+                    continue
+                stats_json = json.dumps([
+                    {"ICON": "user",   "COUNT": f,  "NAME": "粉丝", "SORT": 1},
+                    {"ICON": "like",   "COUNT": l,  "NAME": "获赞", "SORT": 2},
+                    {"ICON": "follow", "COUNT": fo, "NAME": "关注", "SORT": 3},
+                ], ensure_ascii=False)
+                cursor.execute('UPDATE user_info SET stats = ? WHERE id = ?', (stats_json, acc_id))
+                logger.info(f'[migrate] 账号 {acc_id} 的 fans/likes/follows 已迁移至 stats')
+        except Exception as e:
+            logger.warning(f'[migrate] fans/likes/follows → stats 数据迁移失败(可忽略): {e}')
 
     conn.commit()
     conn.close()

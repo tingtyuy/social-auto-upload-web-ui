@@ -6,9 +6,12 @@ Channels (视频号) platform implementation.
 and shared utilities from ``backend/impl/_utils.py``.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -23,6 +26,7 @@ from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
     parse_schedule_time,
+    raise_if_page_closed,
     save_login_result,
     scrape_tencent_profile,
 )
@@ -32,13 +36,16 @@ from ..base_platform import BasePlatform
 # Constants
 # ---------------------------------------------------------------------------
 
-TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
+TENCENT_LOGIN_URL = "https://channels.weixin.qq.com/login.html"
+TENCENT_PLATFORM_URL = "https://channels.weixin.qq.com/platform"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
 
 # 调试开关:True = 走到发布按钮时只输出参数日志、不实际点击发布(便于检查内容);
-# False = 正常点击发布。验证完发布内容无误后改回 False 即可。
-_PUBLISH_DRY_RUN = False
+# False = 正常点击发布。默认关闭(真实发布),需要模拟时设环境变量
+# CHANNELS_DRY_RUN_PUBLISH=1。
+import os as _os_ch_dry
+_PUBLISH_DRY_RUN = _os_ch_dry.environ.get("CHANNELS_DRY_RUN_PUBLISH", "0") == "1"
 
 
 def _format_short_title(origin_title: str) -> str:
@@ -60,161 +67,15 @@ def _format_short_title(origin_title: str) -> str:
     return formatted_string
 
 
-# ---------------------------------------------------------------------------
-# QR-code extraction helpers
-# ---------------------------------------------------------------------------
-
-async def _extract_qrcode_src(page) -> str:
-    """Extract the QR code image ``src`` from the Channels login page.
-
-    The QR code lives inside an iframe (``login-for-iframe``) on the
-    Channels login page.  Falls back to top-level selectors when the
-    iframe is unavailable.
-    """
-    # Primary: iframe approach
-    try:
-        iframe_locator = page.frame_locator('[src*="login-for-iframe"]')
-        qr_code_img = iframe_locator.locator("div#app img.qrcode").first
-        await qr_code_img.wait_for(state="visible", timeout=30000)
-        src = await qr_code_img.get_attribute("src")
-        if src and src.startswith("data:image/"):
-            return src
-    except Exception:
-        pass
-
-    # Fallback: top-level selectors
-    for selector in (
-        "div.login-qrcode-wrap img.qrcode",
-        "div.qrcode-wrap img.qrcode",
-        "img.qrcode",
-        'img[src^="data:image/"]',
-    ):
-        qr_code_img = page.locator(selector).first
-        try:
-            if not await qr_code_img.count() or not await qr_code_img.is_visible():
-                continue
-            src = await qr_code_img.get_attribute("src")
-            if src and src.startswith("data:image/"):
-                return src
-        except Exception:
-            continue
-
-    raise RuntimeError("未获取到视频号登录二维码地址")
-
-
-async def _is_qrcode_expired(page) -> bool:
-    """Check whether the displayed QR code has expired."""
-    for selector in (
-        'div.mask.show p.refresh-tip:has-text("二维码已过期，点击刷新")',
-        'div.mask.show p.refresh-tip:has-text("网络不可用，点击刷新")',
-        'p.refresh-tip:has-text("二维码已过期，点击刷新")',
-        'p.refresh-tip:has-text("网络不可用，点击刷新")',
-    ):
-        tip = page.locator(selector).first
-        try:
-            if await tip.count() and await tip.is_visible():
-                return True
-        except Exception:
-            continue
-    return False
-
-
-async def _is_qrcode_scanned(page) -> bool:
-    """Check whether the user has scanned the QR code."""
-    for selector in (
-        'div.qr-tip div:has-text("已扫码")',
-        'div.qr-tip div:has-text("需在手机上进行确认")',
-    ):
-        tip = page.locator(selector).first
-        try:
-            if await tip.count() and await tip.is_visible():
-                return True
-        except Exception:
-            continue
-    return False
-
-
-async def _refresh_qrcode(page) -> None:
-    """Click the refresh area to regenerate an expired QR code."""
-    # Try visible refresh-wrap first
-    for selector in (
-        "div.login-qrcode-wrap div.mask.show div.refresh-wrap",
-        "div.login-qrcode-wrap div.mask.show .refresh-wrap",
-    ):
-        refresh_wrap = page.locator(selector).first
-        try:
-            if not await refresh_wrap.count() or not await refresh_wrap.is_visible():
-                continue
-            await refresh_wrap.click()
-            return
-        except Exception:
-            continue
-
-    # Try tip-based refresh
-    for selector in (
-        'div.mask.show p.refresh-tip:has-text("二维码已过期，点击刷新")',
-        'div.mask.show p.refresh-tip:has-text("网络不可用，点击刷新")',
-        'p.refresh-tip:has-text("二维码已过期，点击刷新")',
-        'p.refresh-tip:has-text("网络不可用，点击刷新")',
-    ):
-        tip = page.locator(selector).first
-        try:
-            if not await tip.count() or not await tip.is_visible():
-                continue
-            refresh_wrap = tip.locator(
-                "xpath=ancestor::div[contains(@class, 'refresh-wrap')]"
-            ).first
-            if await refresh_wrap.count():
-                await refresh_wrap.click()
-            else:
-                await tip.click()
-            return
-        except Exception:
-            continue
-
-    # Final fallback
-    fallback = page.locator("div.login-qrcode-wrap div.refresh-wrap").first
-    if await fallback.count():
-        await fallback.click()
-        return
-
-    raise RuntimeError("未找到可点击的视频号二维码刷新区域")
-
-
 async def _is_login_completed(page) -> bool:
-    """Detect whether the user has completed the QR-code login flow."""
-    publish_markers = [
-        page.locator('div:has-text("发表视频")').first,
-        page.locator('button:has-text("发表")').first,
-        page.locator('button:has-text("保存草稿")').first,
-    ]
-    for marker in publish_markers:
-        try:
-            if await marker.count() and await marker.is_visible():
-                return True
-        except Exception:
-            continue
+    """Detect whether the user has completed the QR-code login flow.
 
-    if not (
-        page.url.startswith(TENCENT_UPLOAD_URL)
-        or page.url.startswith(TENCENT_MANAGE_URL)
-    ):
-        return False
-
-    login_markers = [
-        page.locator("div.login-qrcode-wrap").first,
-        page.locator("div.qrcode-wrap").first,
-        page.locator("img.qrcode").first,
-        page.locator('span:has-text("微信扫码登录 视频号助手")').first,
-    ]
-    for marker in login_markers:
-        try:
-            if await marker.count() and await marker.is_visible():
-                return False
-        except Exception:
-            continue
-
-    return True
+    登录成功后页面会从 ``/login.html`` 跳转到 ``/platform/*``（创作中心首页
+    或其子页）。这里只看 URL：进入 ``/platform`` 且不在 ``/login`` 即视为
+    登录完成。不依赖宽泛文本匹配，避免登录页文案误判。
+    """
+    url = page.url
+    return "/platform" in url and "/login" not in url
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +96,12 @@ async def _fill_title_and_tags(page, title: str, tags: list[str]) -> None:
     """
     await page.locator("div.input-editor").click()
     for tag in tags:
-        await page.keyboard.type("#" + tag)
+        await page.keyboard.type("#" + tag, delay=30)
         await page.keyboard.press("Space")
+        # 每个标签输入完后停 0.5s,让 React 完整消化上一个 onChange
+        # 避免下一个标签的 '#' 字符和上一个 setState 在异步上撞车,
+        # 出现「最后一个标签没空格」/ 字符丢失 / 标签粘连等问题
+        await asyncio.sleep(0.5)
     logger.info(f"[填写标题] added {len(tags)} hashtags to description editor")
 
 
@@ -381,6 +246,118 @@ async def _apply_location(page, location_name: str = "") -> None:
     logger.warning("[设置位置] 未找到位置: %s", location_name)
 
 
+async def _apply_activity(page, activity_name: str = "", activity_id: str = "") -> None:
+    """选择指定活动(按 name + creator 复合匹配);空字符串时跳过,保持默认「不参与活动」。
+
+    DOM(用户实际抓取,weui 框架):
+      入口: div.post-activity-wrap > div.activity-display (显示「不参与活动」/已选活动,点击展开)
+      搜索框: input[placeholder="搜索活动"] (.weui-desktop-form__input)
+      下拉: div.common-option-list-wrap .option-item
+        - 第一项 .option-item.active 永远是「不参与活动」(遍历时跳过 index 0)
+        - 每项内 .activity-item-info 下两个 span:
+            .creator-name(发起人,可能为空)
+            .name(活动名)
+        - 已选项内含 .yes-icon svg
+
+    策略(与 _apply_location 一致):
+      - 空值 → 直接 return(视频号默认就是「不参与活动」)
+      - 找不到精确匹配 → warning + return(保持当前状态)
+
+    复合匹配: activity_id 格式为 f\"{name}|{creator_name}\"(前端 RemoteSearchSelect
+    传的完整对象),用来区分同名不同发起人的活动。仅传 name 时退化为按 name 匹配。
+    """
+    if not activity_name:
+        return  # 空值跳过,默认就是「不参与活动」
+
+    # 解析 activity_id 得到 creator_name(若有)
+    target_creator = ""
+    if activity_id and "|" in activity_id:
+        parts = activity_id.split("|", 1)
+        if len(parts) == 2:
+            # parts[0] = name(应等于 activity_name),parts[1] = creator_name
+            target_creator = parts[1].strip()
+
+    # 1. 点击活动卡片展开搜索面板
+    activity_wrap = page.locator("div.post-activity-wrap").first
+    if await activity_wrap.count() == 0:
+        logger.info("[设置活动] 未找到活动卡片,跳过")
+        return
+    await activity_wrap.click()
+    await asyncio.sleep(1)
+
+    # 2. 在搜索框一次性填入关键字(替代之前的逐字 keyboard.type):
+    #    原写法 delay=50 一字一字敲,网络好时整个输入要几百 ms 起步,而且
+    #    视频号下拉的 debounce 是从最后一个 keyup 开始算,逐字输入拉长了
+    #    "最后一次输入"到"下拉出结果"的等待窗口。一次性 fill() 走单个
+    #    input 事件,React 监听能正常拿到。
+    search_input = page.locator('input[placeholder="搜索活动"]').first
+    if await search_input.count() == 0:
+        logger.warning("[设置活动] 未找到活动搜索框,跳过")
+        return
+    await search_input.click()
+    await search_input.fill(activity_name)
+
+    # 3. 等待下拉真实数据渲染(参考小红书 _fill_tags 修法):
+    #    clear_and_type 后 sleep 固定 2s 不够,网络慢时下拉还没出来就遍历会
+    #    命中 0 项 → 误判「未找到」。改成 wait_for 等到下拉里至少 1 个 .option-item
+    #    (除 index 0「不参与活动」外)真正渲染可见再开始匹配。
+    real_option = page.locator(
+        'div.common-option-list-wrap .option-item .activity-item-info .name'
+    ).first
+    try:
+        await real_option.wait_for(state="visible", timeout=8000)
+    except Exception as exc:
+        logger.warning("[设置活动] 等待下拉数据超时: %s", exc)
+        # 不直接 return —— 继续走下面的匹配,可能是真的 0 结果
+    await asyncio.sleep(0.3)  # 给最后一项的 DOM 一点点缓冲
+
+    # 4. 在下拉项里找精确匹配(index 0 是「不参与活动」,跳过)
+    #    优先按 (name, creator) 复合匹配,无 creator 时退化为按 name 匹配
+    options = page.locator("div.common-option-list-wrap .option-item")
+    count = await options.count()
+    name_only_fallback = None  # 记录第一个 name 匹配的选项,复合匹配失败时兜底
+    for i in range(1, count):  # 跳过 index 0
+        opt = options.nth(i)
+        info_el = opt.locator(".activity-item-info").first
+        if await info_el.count() == 0:
+            continue
+        name_el = info_el.locator(".name").first
+        creator_el = info_el.locator(".creator-name").first
+        if await name_el.count() == 0:
+            continue
+        try:
+            name = (await name_el.inner_text()).strip()
+        except Exception:
+            continue
+        if name != activity_name:
+            continue
+        # name 匹配上了
+        if target_creator:
+            try:
+                creator_text = (await creator_el.inner_text()).strip().rstrip("· ").strip() if await creator_el.count() > 0 else ""
+            except Exception:
+                creator_text = ""
+            if creator_text == target_creator:
+                await opt.click()
+                logger.info("[设置活动] 已选择活动: %s (creator=%s)", activity_name, target_creator)
+                return
+            # name 匹配但 creator 不匹配 → 记录第一个用于后续兜底
+            if name_only_fallback is None:
+                name_only_fallback = (i, opt)
+        else:
+            # 没有 target_creator,直接按 name 匹配
+            await opt.click()
+            logger.info("[设置活动] 已选择活动: %s (按 name 匹配)", activity_name)
+            return
+
+    # 复合匹配失败 → 兜底用 name 唯一匹配的那一个
+    if name_only_fallback is not None:
+        await name_only_fallback[1].click()
+        logger.warning("[设置活动] 复合匹配未命中,按 name 兜底: %s (期望 creator=%s)", activity_name, target_creator)
+        return
+    logger.warning("[设置活动] 未找到活动: %s", activity_name)
+
+
 async def _apply_original_statement(page, category: str | None = None) -> None:
     """Mark the video as original if the option is available."""
     # Simple checkbox
@@ -434,6 +411,351 @@ async def _apply_original_statement(page, category: str | None = None) -> None:
                 await declare_button.click()
 
 
+# ---------------------------------------------------------------------------
+# 视频标注(mark tag):发布页「选择视频标注」下拉
+#
+# DOM(用户实际抓取, 禁用 data-v 随机串):
+#   入口: .mark-tag-select .select-display (点击展开 .mark-tag-options)
+#   选项: .mark-tag-option > .option-main (文案精确匹配 tagName)
+#
+# 选「内容为自行拍摄」会弹 .weui-desktop-dialog:
+#   标题: 「添加拍摄时间和地点」
+#   拍摄时间: input[placeholder="请选择拍摄时间"] + weui 日历面板
+#   拍摄地点: .location-cascader 级联(国家 -> 省 -> 市), 子级点击后懒加载
+# 选「内容为转载」也会弹 dialog, 内含转载来源 input。
+#
+# 策略: 所有选项(含「无需标注」)都去页面真正选中; 弹窗/子字段全程容错,
+# 找不到或匹配失败时 warning 跳过, 不中断发布。
+# ---------------------------------------------------------------------------
+
+_SHOOT_TAG = "内容为自行拍摄"
+_REPOST_TAG = "内容为转载"
+
+
+async def _select_mark_tag_option(page, tag_name: str) -> bool:
+    """展开视频标注下拉并点击指定选项, 返回是否成功选中。
+
+    点选「内容为自行拍摄 / 内容为转载」会触发二级弹窗, 弹窗由调用方
+    (_fill_shoot_info_dialog / _fill_repost_source_dialog)处理。
+    """
+    select = page.locator(".mark-tag-select").first
+    if await select.count() == 0:
+        logger.warning("[视频标注] 未找到标注下拉入口, 跳过")
+        return False
+
+    # 点击 display 展开下拉(若已展开, 再点一次会收起, 故按状态决定)
+    try:
+        is_open = "is-open" in (await select.get_attribute("class") or "")
+    except Exception:
+        is_open = False
+    if not is_open:
+        await select.locator(".select-display").first.click()
+        await asyncio.sleep(0.6)
+
+    options = page.locator(".mark-tag-options .mark-tag-option")
+    count = await options.count()
+    for i in range(count):
+        try:
+            main_text = (await options.nth(i).locator(".option-main").first.inner_text(timeout=1000)).strip()
+        except Exception:
+            continue
+        if main_text == tag_name:
+            await options.nth(i).click()
+            logger.info("[视频标注] 已选择标注: %s", tag_name)
+            await asyncio.sleep(0.8)  # 等待可能的二级弹窗
+            return True
+    logger.warning("[视频标注] 下拉中未找到选项: %s", tag_name)
+    return False
+
+
+async def _fill_shoot_date_in_dialog(dialog, shoot_date: str) -> None:
+    """在自行拍摄弹窗内填入拍摄时间(YYYY-MM-DD)。
+
+    复用 weui datepicker 交互(与 _set_schedule_time 同款), 但 scope 限定在
+    弹窗内, 避免误触发表单的定时发布选择器。
+    """
+    if not shoot_date:
+        logger.info("[视频标注] 未提供拍摄时间, 跳过日期填写")
+        return
+
+    try:
+        from datetime import datetime
+        dt = datetime.strptime(shoot_date, "%Y-%m-%d")
+    except ValueError:
+        logger.warning("[视频标注] 拍摄时间格式非法(需 YYYY-MM-DD): %s, 跳过", shoot_date)
+        return
+
+    date_input = dialog.locator('input[placeholder="请选择拍摄时间"]').first
+    if await date_input.count() == 0:
+        logger.warning("[视频标注] 未找到拍摄时间输入框, 跳过")
+        return
+    await date_input.click()
+    await asyncio.sleep(0.5)
+
+    # 翻到目标月份(weui 面板按年/月标签判断)
+    target_year = dt.strftime("%Y年")
+    target_month = dt.strftime("%m月")
+    for _ in range(24):  # 最多翻 24 个月
+        try:
+            labels = dialog.locator("span.weui-desktop-picker__panel__label")
+            n = await labels.count()
+            year_txt = (await labels.nth(0).inner_text(timeout=1000)).strip() if n > 0 else ""
+            month_txt = (await labels.nth(1).inner_text(timeout=1000)).strip() if n > 1 else ""
+            if year_txt == target_year and month_txt == target_month:
+                break
+        except Exception:
+            pass
+        nxt = dialog.locator("button.weui-desktop-btn__icon__right").first
+        if await nxt.count():
+            await nxt.click()
+            await asyncio.sleep(0.2)
+        else:
+            break
+
+    # 点对应日期(跳过 disabled / faded 占位)
+    cells = dialog.locator("table.weui-desktop-picker__table a")
+    total = await cells.count()
+    for i in range(total):
+        try:
+            el = cells.nth(i)
+            cls = await el.evaluate("e => e.className")
+            if "weui-desktop-picker__disabled" in cls:
+                continue
+            txt = (await el.inner_text(timeout=1000)).strip()
+            if txt == str(dt.day):
+                await el.click()
+                logger.info("[视频标注] 拍摄时间已填入: %s", shoot_date)
+                await asyncio.sleep(0.3)
+                return
+        except Exception:
+            continue
+    logger.warning("[视频标注] 未在日历中找到可选日期: %s", shoot_date)
+
+
+async def _fill_shoot_region_in_dialog(dialog, region_path: list[str]) -> None:
+    """在自行拍摄弹窗内逐级选择拍摄地点级联菜单。
+
+    region_path 形如 ['中国', '广东', '深圳']; 叶子国家(无省市)传 ['日本'] 即止。
+    子级菜单点击后才懒加载, 故每级点完等子菜单出现再匹配下一级。
+
+    交互时序(视频号 weui 级联):
+      1. 点击 inner-button 展开第一级(国家, 共 240 项)
+      2. 点国家 → 若有子级则展开下一级; 若是叶子则级联面板自动关闭
+      3. 选到叶子后, .weui-desktop-dropdown-menu 消失 → 级联选择完成
+      4. 调用方据此再点弹窗的「确认」按钮
+
+    性能: 不用逐项 inner_text 遍历(240 项极慢), 改用 get_by_text 精确定位。
+    """
+    if not region_path:
+        logger.info("[视频标注] 未提供拍摄地点, 跳过级联选择")
+        return
+
+    cascader = dialog.locator(".location-cascader").first
+    if await cascader.count() == 0:
+        logger.warning("[视频标注] 未找到拍摄地点级联组件, 跳过")
+        return
+
+    # 展开第一级(点击 inner-button 触发下拉)
+    trigger = cascader.locator(".weui-desktop-form__dropdowncascade__dt__inner-button").first
+    try:
+        await trigger.click()
+        await asyncio.sleep(0.8)  # 等第一级(240 国)渲染
+    except Exception:
+        logger.warning("[视频标注] 无法展开拍摄地点级联, 跳过")
+        return
+
+    # 逐级匹配: 用 get_by_text 精确定位当前可见菜单项(避免遍历 240 国)
+    for level, target_name in enumerate(region_path):
+        target_name = str(target_name).strip()
+        # 级联项文本在 .weui-desktop-dropdown__list-ele__text 内, 用精确文本定位
+        # scope 限定在 cascader 内, 避免误触其它下拉
+        item = cascader.locator(
+            ".weui-desktop-dropdown__list-ele__text"
+        ).filter(has_text=target_name).first
+        # 子级懒加载, 最多等 ~3s 让目标项出现
+        try:
+            await item.wait_for(state="visible", timeout=3000)
+        except Exception:
+            logger.warning("[视频标注] 拍摄地点第 %d 级未找到: %s", level + 1, target_name)
+            return
+        try:
+            await item.click()
+            logger.info("[视频标注] 拍摄地点第 %d 级已选: %s", level + 1, target_name)
+        except Exception as e:
+            logger.warning("[视频标注] 拍摄地点第 %d 级点击失败: %s (%s)", level + 1, target_name, e)
+            return
+        await asyncio.sleep(0.5)  # 等下一级懒加载/面板关闭
+
+    # 选到叶子后, 级联下拉菜单(.weui-desktop-dropdown-menu)应自动消失。
+    # 等它消失再返回, 让调用方安全地点「确认」(否则级联面板可能盖住确认按钮)。
+    menu = cascader.locator(".weui-desktop-dropdown-menu").first
+    for _ in range(20):  # 最多等 ~2s
+        try:
+            if await menu.count() == 0 or not await menu.is_visible():
+                logger.info("[视频标注] 拍摄地点级联已收起, 选择完成: %s", " / ".join(map(str, region_path)))
+                return
+        except Exception:
+            return
+        await asyncio.sleep(0.1)
+    logger.info("[视频标注] 拍摄地点级联仍未收起(已选 %s), 继续执行", " / ".join(map(str, region_path)))
+
+
+async def _confirm_mark_tag_dialog(page, dialog=None) -> bool:
+    """点击视频标注弹窗的「确定」按钮并关闭弹窗, 返回是否成功。
+
+    视频号规则: 拍摄时间和拍摄地点都填完前, 确定按钮是 disabled 状态。
+    故这里要等按钮从禁用变为可用(最多 ~5s), 再点击。
+    1.txt 实测: 按钮文案是「确定」(非「确认」), class 含 weui-desktop-btn_disabled,
+    位于弹窗 .weui-desktop-dialog__ft 内的 .weui-desktop-btn_wrp。
+
+    Args:
+        dialog: 若传入, 只在该弹窗 scope 内找确定按钮, 避免页面上多个弹窗
+                (如封面裁剪/级联残留) 时点错。不传则退化为全局 .first。
+    """
+    scope = dialog if dialog is not None else page
+    # 弹窗底部主按钮(优先匹配文案「完成」/「确定」, 兜底「确认」/ 主按钮)
+    # 转载弹窗用「完成」, 自行拍摄弹窗用「确定」。
+    selectors = (
+        'div.weui-desktop-dialog__ft button:has-text("完成")',
+        'div.weui-desktop-dialog__ft button:has-text("确定")',
+        'div.weui-desktop-dialog__ft button:has-text("确认")',
+        'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary',
+        'button.weui-desktop-btn_primary:has-text("完成")',
+        'button.weui-desktop-btn_primary:has-text("确定")',
+    )
+    btn = None
+    for selector in selectors:
+        try:
+            cand = scope.locator(selector).first
+            if await cand.count() and await cand.is_visible():
+                btn = cand
+                logger.info("[视频标注] 定位到确定按钮: %s", selector)
+                break
+        except Exception:
+            continue
+    if btn is None:
+        logger.warning("[视频标注] 未找到弹窗确定按钮")
+        return False
+
+    # 等待按钮从 disabled 变为可用(拍摄信息填完后才解锁)
+    for _ in range(25):  # 最多等 ~5s
+        try:
+            cls = await btn.get_attribute("class") or ""
+            if "weui-desktop-btn_disabled" not in cls:
+                break
+        except Exception:
+            break
+        await asyncio.sleep(0.2)
+    else:
+        logger.warning("[视频标注] 确定按钮仍为禁用态(拍摄信息可能未填全), 仍尝试点击")
+
+    try:
+        await btn.click()
+        logger.info("[视频标注] 弹窗已确定, 等待关闭")
+        # 等弹窗消失(优先用传入的 dialog, 否则全局第一个)
+        target = dialog if dialog is not None else page.locator("div.weui-desktop-dialog").first
+        try:
+            await target.wait_for(state="hidden", timeout=5000)
+            logger.info("[视频标注] 弹窗已关闭")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.warning("[视频标注] 点击确定按钮失败: %s", e)
+        return False
+
+
+async def _fill_shoot_info_dialog(page, shoot_date: str, shoot_region: list[str]) -> None:
+    """选「内容为自行拍摄」后, 在弹窗里填拍摄时间 + 拍摄地点并确认。"""
+    dialog = page.locator("div.weui-desktop-dialog").filter(has_text="添加拍摄时间和地点").first
+    try:
+        await dialog.wait_for(state="visible", timeout=5000)
+    except Exception:
+        logger.warning("[视频标注] 自行拍摄弹窗未出现, 跳过子字段填写")
+        return
+    logger.info("[视频标注] 自行拍摄弹窗已出现, 开始填写拍摄信息")
+
+    await _fill_shoot_date_in_dialog(dialog, shoot_date)
+    await _fill_shoot_region_in_dialog(dialog, shoot_region)
+    # 把 dialog 传进去, 限定确定按钮的查找 scope, 避免误点其它弹窗
+    await _confirm_mark_tag_dialog(page, dialog)
+
+
+async def _fill_repost_source_dialog(page, repost_source: str) -> None:
+    """选「内容为转载」后, 在弹窗里填转载来源(选填)并点「完成」。
+
+    转载弹窗 DOM(用户实际抓取):
+      标题: <h3>添加转载来源</h3>
+      输入: <textarea class="repost-textarea" placeholder="在此处填写转载来源...">
+      底部: 取消 / 完成(初始 disabled, 填入内容后解锁)
+    """
+    dialog = page.locator("div.weui-desktop-dialog").filter(has_text="添加转载来源").first
+    try:
+        await dialog.wait_for(state="visible", timeout=5000)
+    except Exception:
+        # 兜底: 用第一个可见 dialog
+        dialog = page.locator("div.weui-desktop-dialog").first
+        if not await dialog.count():
+            logger.warning("[视频标注] 转载弹窗未出现, 跳过")
+            return
+    logger.info("[视频标注] 转载弹窗已出现, 开始填写转载来源")
+
+    if repost_source:
+        # 转载来源是 textarea(非 input), 用 class 或 placeholder 精确定位
+        textarea_selectors = (
+            'textarea.repost-textarea',
+            'textarea[placeholder*="转载来源"]',
+            'textarea:visible',
+        )
+        filled = False
+        for selector in textarea_selectors:
+            try:
+                ta = dialog.locator(selector).first
+                if await ta.count() and await ta.is_visible():
+                    await ta.click()
+                    await ta.fill("")
+                    await ta.type(repost_source, delay=20)
+                    logger.info("[视频标注] 转载来源已填入: %s", repost_source)
+                    filled = True
+                    await asyncio.sleep(0.5)  # 等「完成」按钮解锁
+                    break
+            except Exception:
+                continue
+        if not filled:
+            logger.warning("[视频标注] 未找到转载来源输入框, 仅确认弹窗")
+    else:
+        logger.info("[视频标注] 未提供转载来源, 直接确认弹窗")
+
+    await _confirm_mark_tag_dialog(page, dialog)
+
+
+async def _apply_mark_tag(
+    page,
+    tag_name: str,
+    shoot_date: str = "",
+    shoot_region: list[str] | None = None,
+    repost_source: str = "",
+) -> None:
+    """选择视频标注下拉项, 并在需要时处理二级弹窗。
+
+    所有选项(含「无需标注」)都会去页面下拉里真正选中, 不因默认值跳过。
+    """
+    tag_name = (tag_name or "无需标注").strip()
+    shoot_region = shoot_region or []
+    logger.info("[视频标注] 开始设置, tag=%r, shoot_date=%r, region=%s, repost=%r",
+                tag_name, shoot_date, shoot_region, repost_source)
+
+    selected = await _select_mark_tag_option(page, tag_name)
+    if not selected:
+        return
+
+    if tag_name == _SHOOT_TAG:
+        await _fill_shoot_info_dialog(page, shoot_date, shoot_region)
+    elif tag_name == _REPOST_TAG:
+        await _fill_repost_source_dialog(page, repost_source)
+    # 其他选项(含「无需标注」)无需二级弹窗, 选完即止
+
+
 async def _wait_for_upload_complete(page, file_path: str) -> None:
     """Poll until the publish button becomes enabled (upload finished).
 
@@ -441,6 +763,7 @@ async def _wait_for_upload_complete(page, file_path: str) -> None:
     re-uploaded automatically.
     """
     while True:
+        raise_if_page_closed(page)
         try:
             publish_button = page.get_by_role("button", name="发表")
             button_class = await publish_button.get_attribute("class")
@@ -510,6 +833,7 @@ async def _wait_for_cover_ready(page, *, action: str = "") -> None:
     logger.info(f"[设置封面] 封面阻塞提示出现({action}):「{blocking}」，开始无限等待...")
     waited = 0
     while True:
+        raise_if_page_closed(page)
         await asyncio.sleep(1)
         waited += 1
         still_blocking = None
@@ -533,67 +857,30 @@ async def _wait_for_cover_ready(page, *, action: str = "") -> None:
 
 
 async def _set_thumbnail(page, thumbnail_path: str | None, thumbnail_landscape_path: str | None = None, thumbnail_portrait_path: str | None = None) -> None:
-    """Set the video cover/thumbnail (5-step flow).
+    """Set the video cover/thumbnail.
 
-    Steps:
-    1. Check for cover preview area, then determine which cover type is visible.
-    2. Click the cover entry (vertical 3:4 or horizontal 4:3).
-    3. Wait for the cover-edit dialog.
-    4. Upload the cover image file.
-    5. Handle the crop dialog if it appears.
-    6. Confirm the cover selection.
+    视频号发布页的封面入口数量取决于视频方向：
+    - 竖版视频：只有竖版封面入口（个人主页卡片 3:4）
+    - 横版视频：同时有横版封面入口（分享卡片 4:3）+ 竖版封面入口（个人主页卡片 3:4）
+
+    本函数遍历页面上**所有可见**的封面入口，对每个入口分别上传对应方向的封面：
+    - horizontal 入口 → thumbnail_landscape_path（4:3）
+    - vertical 入口   → thumbnail_portrait_path（3:4）
+    没有对应封面图的入口跳过。
     """
     if not thumbnail_path and not thumbnail_landscape_path and not thumbnail_portrait_path:
         return
 
     logger.info("[设置封面] setting cover image")
 
-    # Step 1: check if cover preview area exists, then find visible cover type
+    # Step 1: 检测封面预览区是否存在
     cover_preview = page.locator('div:has(> .label):has-text("封面预览")').first
-    has_cover_preview = False
     try:
         if await cover_preview.count():
             await cover_preview.wait_for(state="visible", timeout=5000)
-            has_cover_preview = True
             logger.info("[设置封面] found cover preview area")
     except Exception:
         logger.info("[设置封面] no cover preview area found, trying direct cover detection")
-
-    # Step 2: click cover entry - try vertical first, then horizontal
-    cover_entry_selectors = [
-        # Vertical cover (个人主页卡片, 3:4)
-        ('div.vertical-cover-wrap', 'vertical'),
-        # Horizontal cover (分享卡片, 4:3)
-        ('div.horizon-cover-wrap', 'horizontal'),
-    ]
-    cover_type = None
-    cover_entry = None
-    for selector, ctype in cover_entry_selectors:
-        candidate = page.locator(selector).first
-        try:
-            if not await candidate.count():
-                continue
-            await candidate.wait_for(state="visible", timeout=3000)
-            cover_entry = candidate
-            cover_type = ctype
-            logger.info(f"[设置封面] cover entry found: {selector} ({ctype})")
-            break
-        except Exception:
-            continue
-
-    if not cover_entry:
-        logger.info("[设置封面] WARNING: no cover entry found, skipping cover")
-        return
-
-    # Determine which thumbnail to use based on cover type
-    effective_thumbnail = thumbnail_path
-    if cover_type == 'horizontal' and thumbnail_landscape_path:
-        effective_thumbnail = thumbnail_landscape_path
-    elif cover_type == 'vertical' and thumbnail_portrait_path:
-        effective_thumbnail = thumbnail_portrait_path
-    if not effective_thumbnail:
-        logger.info(f"[设置封面] no thumbnail for {cover_type} cover, skipping")
-        return
 
     cover_dialog_selectors = [
         ("div.weui-desktop-dialog", "编辑个人主页卡片"),
@@ -612,7 +899,6 @@ async def _set_thumbnail(page, thumbnail_path: str | None, thumbnail_landscape_p
                     return dialog
             except Exception:
                 continue
-        # fallback：任意可见对话框
         try:
             fallback = page.locator("div.weui-desktop-dialog").first
             if await fallback.count() and await fallback.is_visible():
@@ -622,127 +908,234 @@ async def _set_thumbnail(page, thumbnail_path: str | None, thumbnail_landscape_p
             pass
         return None
 
-    # Step 3: 点击封面入口直到对话框出现 —— 简单粗暴的无限重试。
-    # 视频号在视频上传/封面预览图生成期间，点击封面入口会被 weui-desktop-popover
-    # （「文件上传中...」/「预览图生成中...」）拦截，对话框不会弹出。
-    # 因此每轮重试都先 hover/click → 阻塞等待 popover 消失 → 再查对话框，
-    # 直到对话框出现为止。
-    logger.info("[设置封面] 开始点击封面入口，直到封面对话框出现（无限重试）")
-    cover_dialog = None
-    attempt = 0
-    while cover_dialog is None:
-        attempt += 1
-        try:
-            # hover 触发（popover 可能是 hover 态才出现）
+    async def _do_one_cover(cover_entry, cover_type, effective_thumbnail):
+        """对单个封面入口执行：点击→(横版多一步 popover 点"直接编辑")→等对话框→上传→裁剪确认→确认。"""
+        logger.info(f"[设置封面] 开始点击 {cover_type} 封面入口，直到对话框出现（无限重试）")
+        cover_dialog = None
+        attempt = 0
+        while cover_dialog is None:
+            raise_if_page_closed(page)
+            attempt += 1
             try:
-                await cover_entry.hover()
-            except Exception:
-                pass
-            await page.wait_for_timeout(500)
-            await _wait_for_cover_ready(page, action=f"封面入口 hover(第{attempt}轮)")
-
-            # click 进入编辑
-            await cover_entry.click()
-            await page.wait_for_timeout(800)
-            await _wait_for_cover_ready(page, action=f"封面入口 click(第{attempt}轮)")
-
-            # 查对话框
-            cover_dialog = await _find_cover_dialog()
-        except Exception as retry_exc:
-            logger.info(f"[设置封面] 封面入口重试异常(第{attempt}轮): {retry_exc}")
-
-        if cover_dialog is None:
-            if attempt == 1 or attempt % 5 == 0:
-                logger.info(
-                    f"[上传视频] 封面对话框未出现，继续重试点击封面入口(第{attempt}轮)"
-                )
-            await page.wait_for_timeout(1000)
-
-    # Step 4: upload cover file
-    file_input_selectors = [
-        '.single-cover-uploader-wrap input[type="file"]',
-        'input[type="file"][accept*="image"]',
-        '.cover-uploader-wrap input[type="file"]',
-        'input[type="file"]',
-    ]
-    file_input = None
-    for selector in file_input_selectors:
-        try:
-            locator = cover_dialog.locator(selector).first
-            if await locator.count():
-                file_input = locator
-                logger.info(f"[设置封面] found file input: {selector}")
-                break
-        except Exception:
-            continue
-
-    if not file_input:
-        try:
-            file_input = page.locator(
-                "div.weui-desktop-dialog input[type='file']"
-            ).first
-            if not await file_input.count():
-                logger.info("[设置封面] WARNING: no file input for cover, skipping")
-                return
-        except Exception:
-            return
-
-    await file_input.wait_for(state="attached", timeout=10000)
-    # 上传封面文件前再次阻塞等待（预览图生成中等提示可能此时出现）
-    await _wait_for_cover_ready(page, action="上传封面文件前")
-    logger.info(f"[设置封面] uploading cover ({cover_type}): {effective_thumbnail}")
-    await file_input.set_input_files(effective_thumbnail)
-    await page.wait_for_timeout(2000)
-
-    # Step 5: handle crop dialog
-    crop_dialog = page.locator("div.weui-desktop-dialog").filter(
-        has_text="裁剪封面图"
-    ).first
-    if await crop_dialog.count():
-        try:
-            await crop_dialog.wait_for(state="visible", timeout=10000)
-            logger.info("[设置封面] crop dialog appeared")
-            for selector in (
-                'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")',
-                'button:has-text("确定")',
-                "button.weui-desktop-btn_primary",
-            ):
                 try:
-                    btn = crop_dialog.locator(selector).first
-                    if await btn.count() and await btn.is_visible():
-                        await btn.click()
-                        logger.info(f"[设置封面] crop confirmed: {selector}")
-                        await page.wait_for_timeout(1000)
-                        break
+                    await cover_entry.hover()
                 except Exception:
-                    continue
-        except Exception as exc:
-            logger.info(f"[设置封面] WARNING: crop confirm error: {exc}")
+                    pass
+                await page.wait_for_timeout(500)
+                await _wait_for_cover_ready(page, action=f"{cover_type}封面入口 hover(第{attempt}轮)")
+                await cover_entry.click()
+                await page.wait_for_timeout(800)
+                await _wait_for_cover_ready(page, action=f"{cover_type}封面入口 click(第{attempt}轮)")
 
-    # Step 6: confirm cover dialog
-    confirmed = False
-    for selector in (
-        'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确认")',
-        'div.weui-desktop-dialog__ft button:has-text("确认")',
-        'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")',
-        "div.weui-desktop-dialog__ft button.weui-desktop-btn_primary",
-        'button:has-text("确认")',
-    ):
-        try:
-            btn = cover_dialog.locator(selector).first
-            if await btn.count() and await btn.is_visible():
-                await btn.click()
-                logger.info(f"[设置封面] cover confirmed: {selector}")
-                confirmed = True
+                # 横版封面：点击后先弹出 ant-popover「使用此素材作为封面？」，
+                # 需点「直接编辑」才会出现封面上传弹窗；竖版点击后直接出弹窗。
+                if cover_type == 'horizontal':
+                    popover_edit_btn = page.locator(
+                        '.ant-popover .btn-directly-edit button, '
+                        '.ant-popover button:has-text("直接编辑")'
+                    ).first
+                    try:
+                        if await popover_edit_btn.count() and await popover_edit_btn.is_visible():
+                            logger.info(f"[设置封面] {cover_type} 检测到推荐素材 popover，点击「直接编辑」")
+                            await popover_edit_btn.click()
+                            await page.wait_for_timeout(800)
+                            await _wait_for_cover_ready(page, action=f"{cover_type}封面 popover「直接编辑」后")
+                    except Exception as pop_exc:
+                        logger.info(f"[设置封面] {cover_type} popover 处理异常(第{attempt}轮): {pop_exc}")
+
+                cover_dialog = await _find_cover_dialog()
+            except Exception as retry_exc:
+                logger.info(f"[设置封面] {cover_type}封面入口重试异常(第{attempt}轮): {retry_exc}")
+            if cover_dialog is None:
+                if attempt == 1 or attempt % 5 == 0:
+                    logger.info(f"[上传视频] {cover_type}封面对话框未出现，继续重试(第{attempt}轮)")
                 await page.wait_for_timeout(1000)
-                break
+
+        # 上传封面文件
+        file_input_selectors = [
+            '.single-cover-uploader-wrap input[type="file"]',
+            'input[type="file"][accept*="image"]',
+            '.cover-uploader-wrap input[type="file"]',
+            'input[type="file"]',
+        ]
+        file_input = None
+        for selector in file_input_selectors:
+            try:
+                locator = cover_dialog.locator(selector).first
+                if await locator.count():
+                    file_input = locator
+                    logger.info(f"[设置封面] found file input: {selector}")
+                    break
+            except Exception:
+                continue
+        if not file_input:
+            try:
+                file_input = page.locator("div.weui-desktop-dialog input[type='file']").first
+                if not await file_input.count():
+                    logger.info(f"[设置封面] WARNING: no file input for {cover_type} cover, skipping")
+                    return
+            except Exception:
+                return
+
+        await file_input.wait_for(state="attached", timeout=10000)
+        await _wait_for_cover_ready(page, action=f"上传{cover_type}封面文件前")
+        logger.info(f"[设置封面] uploading {cover_type} cover: {effective_thumbnail}")
+        await file_input.set_input_files(effective_thumbnail)
+        await page.wait_for_timeout(2000)
+
+        # 裁剪对话框
+        crop_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="裁剪封面图").first
+        if await crop_dialog.count():
+            try:
+                await crop_dialog.wait_for(state="visible", timeout=10000)
+                logger.info(f"[设置封面] {cover_type} crop dialog appeared")
+                for selector in (
+                    'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")',
+                    'button:has-text("确定")',
+                    "button.weui-desktop-btn_primary",
+                ):
+                    try:
+                        btn = crop_dialog.locator(selector).first
+                        if await btn.count() and await btn.is_visible():
+                            await btn.click()
+                            logger.info(f"[设置封面] {cover_type} crop confirmed: {selector}")
+                            await page.wait_for_timeout(1000)
+                            break
+                    except Exception:
+                        continue
+            except Exception as exc:
+                logger.info(f"[设置封面] WARNING: {cover_type} crop confirm error: {exc}")
+
+        # 确认封面
+        confirmed = False
+        for selector in (
+            'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确认")',
+            'div.weui-desktop-dialog__ft button:has-text("确认")',
+            'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")',
+            "div.weui-desktop-dialog__ft button.weui-desktop-btn_primary",
+            'button:has-text("确认")',
+        ):
+            try:
+                btn = cover_dialog.locator(selector).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click()
+                    logger.info(f"[设置封面] {cover_type} cover confirmed: {selector}")
+                    confirmed = True
+                    await page.wait_for_timeout(1000)
+                    break
+            except Exception:
+                continue
+        if not confirmed:
+            logger.info(f"[设置封面] WARNING: {cover_type} cover confirm button not found")
+        logger.info(f"[设置封面] {cover_type} cover image set complete")
+
+    # Step 2: 收集所有可见的封面入口及其类型
+    cover_entry_defs = [
+        # Vertical cover (个人主页卡片, 3:4)
+        ('div.vertical-cover-wrap', 'vertical', thumbnail_portrait_path),
+        # Horizontal cover (分享卡片, 4:3)
+        ('div.horizon-cover-wrap', 'horizontal', thumbnail_landscape_path),
+    ]
+    # thumbnail_path 作为兜底：若没有对应方向的封面，用它
+    for entry in cover_entry_defs:
+        if not entry[2] and thumbnail_path:
+            cover_entry_defs[cover_entry_defs.index(entry)] = (entry[0], entry[1], thumbnail_path)
+
+    visible_entries = []
+    for selector, ctype, thumb in cover_entry_defs:
+        candidate = page.locator(selector).first
+        try:
+            if not await candidate.count():
+                continue
+            await candidate.wait_for(state="visible", timeout=3000)
+            visible_entries.append((candidate, ctype, thumb))
+            logger.info(f"[设置封面] cover entry found: {selector} ({ctype})")
         except Exception:
             continue
 
-    if not confirmed:
-        logger.info("[设置封面] WARNING: cover confirm button not found")
+    if not visible_entries:
+        logger.info("[设置封面] WARNING: no cover entry found, skipping cover")
+        return
 
-    logger.info("[设置封面] cover image set complete")
+    # Step 3: 对每个可见入口依次设置封面（横版视频会有两个，竖版视频只有一个）
+    for cover_entry, cover_type, effective_thumbnail in visible_entries:
+        if not effective_thumbnail:
+            logger.info(f"[设置封面] no thumbnail for {cover_type} cover, skipping")
+            continue
+        await _do_one_cover(cover_entry, cover_type, effective_thumbnail)
+
+    logger.info("[设置封面] all cover images set complete")
+
+
+async def _link_drama(page, channels_drama: list) -> None:
+    """按用户保存的 trace 在发布页打开剧集弹窗,选中指定剧集。
+
+    channels_drama 形状(从前端 picker 传来,可能为空):
+      [{key, title, cover, extinfo, sourceLeft, sourceRight, trace:{keyword,page}}]
+    视频号 1 条视频只关联 1 部剧集,取第一项。
+    """
+    if not channels_drama:
+        return
+    item = channels_drama[0]
+    if not isinstance(item, dict) or not item.get("key"):
+        logger.info("[关联剧集] 缺少 drama.key,跳过(可能旧数据)")
+        return
+    trace = item.get("trace") or {}
+    kw = (trace.get("keyword") or "").strip()
+    page_num = int(trace.get("page") or 1)
+    # 从 trace/数据里推断 link_type;picker 存的 trace 无 linkType,默认 drama
+    link_type = (item.get("linkType") or trace.get("linkType") or "drama")
+    try:
+        from . import _drama_link_ops as drama_ops
+        # 走真实 DOM 流程: 点链接下拉 → 选剧集类型 → 点子区入口 → 打开剧集弹窗
+        await drama_ops.open_drama_panel(page, link_type)
+        await drama_ops.wait_panel_ready(page)
+        # 按 trace 复现(搜索 → 翻页)
+        if kw:
+            await drama_ops.search(page, kw)
+            await drama_ops.wait_panel_ready(page)
+        if page_num > 1:
+            await drama_ops.go_page(page, page_num)
+            await drama_ops.wait_panel_ready(page)
+        # 选中目标 row(若在当前页),否则滚后续页找
+        target_key = str(item.get("key") or "")
+        info = None
+        for try_page in range(page_num, min(page_num + 10, 50)):
+            if try_page > page_num:
+                await drama_ops.go_page(page, try_page)
+                await drama_ops.wait_panel_ready(page)
+            rows = await drama_ops.scrape_rows(page)
+            hit = next((r for r in rows if str(r.get("key")) == target_key), None)
+            if hit:
+                info = await drama_ops.select_drama_by_id(page, target_key)
+                logger.info(
+                    "[关联剧集] ✓ 已选 drama=%s key=%s page=%d",
+                    info.get("title"), info.get("key"), try_page,
+                )
+                break
+        if not info:
+            logger.warning(
+                "[关联剧集] 找不到 drama key=%s(trace page=%d),跳过",
+                target_key, page_num,
+            )
+        # 关掉弹窗(选完会自动关闭,防御性关一次)
+        await drama_ops.close_panel(page)
+    except Exception as exc:
+        logger.warning("[关联剧集] 选剧集失败(不阻塞发布): %s", exc)
+
+
+async def _link_url(page, link_type: str, url: str) -> None:
+    """链接 → 公众号文章/红包封面: 选下拉项 + 子区「粘贴xx链接」输入框填 URL。
+
+    失败只打 warning,不阻塞发布。
+    """
+    label = "公众号文章" if link_type == "article" else "红包封面"
+    try:
+        from . import _drama_link_ops as drama_ops
+        await drama_ops.link_paste_url(page, link_type, url)
+        logger.info("[%s链接] ✓ 已设置%s链接: %s", label, label, (url or "")[:60])
+    except Exception as exc:
+        logger.warning("[%s链接] 设置%s链接失败(不阻塞发布): %s", label, label, exc)
 
 
 async def _set_schedule_time(page, publish_date) -> None:
@@ -807,6 +1200,7 @@ async def _dismiss_i_know_dialog(page) -> bool:
 async def _submit_publish(page, is_draft: bool = False) -> None:
     """Click the publish (or save-draft) button and wait for navigation."""
     while True:
+        raise_if_page_closed(page)
         try:
             if is_draft:
                 draft_button = page.locator(
@@ -856,16 +1250,36 @@ class ChannelsPlatform(BasePlatform):
     platform_key = "channels"
     platform_name = "视频号"
 
+    # 支持 cookie 字符串导入账号（视频号登录态高度依赖 localStorage，
+    # 仅灌 cookie 可能 sync 拉不到资料，需用户自行验证）
+    supports_cookie_import = True
+    platform_cookie_domain = ".qq.com"
+
+    def _parse_cookie_to_storage_state(self, cookie_str):
+        cookies = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair: continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(), "value": value.strip(),
+                "domain": self.platform_cookie_domain, "path": "/",
+                "expires": expires, "httpOnly": True, "secure": False, "sameSite": "Lax",
+            })
+        return cookies, []
+
     # ------------------------------------------------------------------
     # login — QR code in iframe, then save_login_result
     # ------------------------------------------------------------------
 
     async def login(self, id: str, status_queue: Queue, account_id=None) -> None:
-        """Perform Channels (视频号) login via QR code scan.
+        """Perform Channels (视频号) login.
 
-        Opens ``https://channels.weixin.qq.com``, extracts the QR code
-        from the login iframe, polls for scan/expiry, and completes the
-        post-login flow via ``save_login_result``.
+        直接打开登录页 ``/login.html``，由用户在浏览器里扫码完成登录。
+        后端只负责轮询 URL：一旦从登录页跳到 ``/platform/*``，即判定登录成功，
+        随后导航到创作中心首页抓取头像/昵称并落库。
+        不再提取/推送二维码——前端只等 ``status:200``。
         """
         browser = await self.create_browser(login_mode=True)
         success = False
@@ -874,22 +1288,22 @@ class ChannelsPlatform(BasePlatform):
             page = await context.new_page()
 
             await page.goto(TENCENT_LOGIN_URL)
+            logger.info("[发布] 登录页已打开，等待用户扫码")
 
-            # Extract QR code and push to frontend
-            qrcode_src = await _extract_qrcode_src(page)
-            status_queue.put(json.dumps({
-                "status": "qrcode",
-                "qrcode": qrcode_src,
-            }))
-            logger.info("[发布] QR code ready, waiting for scan")
-
-            # Poll for login completion（无限等，浏览器由用户自己关）
+            # 轮询 URL 判断登录完成（无限等，浏览器由用户自己关）
             poll_interval = 3
-            scanned_logged = False
             while True:
+                # 用户关闭浏览器 = 放弃扫码登录,立即失败而非无限轮询
+                raise_if_page_closed(page)
                 if await _is_login_completed(page):
                     logger.info(f"[发布] login successful, redirected to: {page.url}")
-                    await asyncio.sleep(2)
+                    # 资料卡 (finder-card) 在创作中心首页 /platform 渲染。
+                    # 若登录后落在子页（如 /platform/post/create），导航到首页再抓。
+                    if not page.url.rstrip("/").endswith("channels.weixin.qq.com/platform"):
+                        try:
+                            await page.goto(TENCENT_PLATFORM_URL, timeout=15000)
+                        except Exception as nav_e:
+                            logger.info(f"[发布] 导航到创作中心首页失败(继续尝试抓取): {nav_e}")
                     await save_login_result(
                         context,
                         page,
@@ -898,26 +1312,12 @@ class ChannelsPlatform(BasePlatform):
                         status_queue=status_queue,
                         scrape_fn=scrape_tencent_profile,
                         account_id=account_id,
+                        # 登录成功后在同一个 session 内补抓 stats(视频/关注者),
+                        # 与 sync_profile 共用同一份抓取逻辑
+                        stats_fn=self._login_stats_fn,
                     )
                     success = True
                     return
-
-                if not scanned_logged and await _is_qrcode_scanned(page):
-                    logger.info("[发布] QR code scanned, awaiting confirmation")
-                    scanned_logged = True
-
-                if await _is_qrcode_expired(page):
-                    logger.info("[发布] QR code expired, refreshing")
-                    await _refresh_qrcode(page)
-                    await asyncio.sleep(1)
-                    try:
-                        qrcode_src = await _extract_qrcode_src(page)
-                        status_queue.put(json.dumps({
-                            "status": "qrcode",
-                            "qrcode": qrcode_src,
-                        }))
-                    except Exception:
-                        pass
 
                 await asyncio.sleep(poll_interval)
         except Exception as exc:
@@ -1010,26 +1410,104 @@ class ChannelsPlatform(BasePlatform):
     # sync_profile — open platform URL with cookies, scrape profile
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Channels creator centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """Sync profile info (name, avatar, stats) from Channels creator centre.
+
+        抓取 finder-content-info 上的两个数字:
+        - 视频数  (DOM: `.finder-content-info > div:first-child .finder-info-num`)
+        - 关注者  (DOM: `.finder-content-info .second-info .finder-info-num`)
+        (视频号没有粉丝数概念,"关注者"等价于粉丝)
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         browser = await self.create_browser(headless=True)
         try:
             context = await self.create_context(browser, storage_state=cookie_path)
             page = await context.new_page()
-            await page.goto(TENCENT_UPLOAD_URL)
+            await page.goto(TENCENT_PLATFORM_URL)
             name, avatar = await scrape_tencent_profile(page)
+            stats = await self._scrape_channels_stats(page)
             await page.close()
             await context.close()
-            return name, avatar
+            return {"name": name, "avatar": avatar, "stats": stats}
         except Exception as exc:
             logger.info(f"[发布] sync_profile error: {exc}")
-            return "", ""
+            return {"name": "", "avatar": "", "stats": []}
         finally:
             try:
                 await browser.close()
             except Exception:
                 pass
+
+
+    async def _scrape_channels_stats(self, page) -> list:
+            """抓取视频号创作者中心首页的运营数据。
+
+            页面 DOM 结构(参见用户提供的 2026-07-19 抓取样本):
+                <div class="finder-content-info">
+                  <div><span>视频</span><span class="finder-info-num">11</span></div>
+                  <div class="second-info"><span>关注者</span><span class="finder-info-num">2</span></div>
+                </div>
+
+            Returns:
+                list[dict]: 按 SORT 排序的运营数据列表
+            """
+            stats = []
+            label_map = {
+                "视频":   ("video",  1, "视频"),
+                "关注者": ("follow", 2, "关注者"),
+            }
+
+            try:
+                await page.wait_for_selector(".finder-info-num", timeout=8000)
+            except Exception:
+                logger.info("[channels stats] 等待 .finder-info-num 超时")
+
+            try:
+                raw = await page.evaluate(
+                    '''() => {
+                        const out = [];
+                        document.querySelectorAll('.finder-content-info > div').forEach(div => {
+                            const numEl = div.querySelector('.finder-info-num');
+                            if (!numEl) return;
+                            // 标签在前一个 span 里(不是 .finder-info-num)
+                            const labelSpan = div.querySelector('span:not(.finder-info-num)');
+                            const label = labelSpan ? labelSpan.textContent.trim() : '';
+                            const num = numEl.textContent.trim();
+                            if (label) out.push({label, num});
+                        });
+                        return out;
+                    }'''
+                )
+                for item in raw:
+                    label = item.get('label', '')
+                    if label in label_map:
+                        icon, sort_no, name = label_map[label]
+                        try:
+                            count = int(str(item.get('num', '0')).replace(',', '').replace(' ', '') or '0')
+                        except (ValueError, TypeError):
+                            count = 0
+                        stats.append({"ICON": icon, "COUNT": count, "NAME": name, "SORT": sort_no})
+            except Exception as exc:
+                logger.info(f"[channels stats] 抓取失败: {exc}")
+
+            stats.sort(key=lambda x: x.get("SORT", 999))
+            return stats
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用 _scrape_channels_stats 抓取逻辑,
+        保证"登录后同步"和"同步按钮"看到的运营数据完全一致。
+        """
+        try:
+            try:
+                await page.goto(TENCENT_PLATFORM_URL, timeout=15000)
+            except Exception:
+                pass
+            return await self._scrape_channels_stats(page)
+        except Exception as exc:
+            logger.info(f"[channels login] _login_stats_fn 抓取失败: {exc}")
+            return []
 
     # ------------------------------------------------------------------
     # open_creator_center — KEEP AS-IS (sync CloakBrowser in thread)
@@ -1112,6 +1590,23 @@ class ChannelsPlatform(BasePlatform):
         channels_collection_name = kwargs.get("channels_collection_name", "")
         # 视频号位置(平台级,空字符串=不显示位置)
         channels_location_name = kwargs.get("channels_location_name", "")
+        # 视频号活动(平台级,空字符串=不参与活动)
+        channels_activity_name = kwargs.get("channels_activity_name", "")
+        # 视频号活动复合 id: 格式 f"{name}|{creator_name}",用于同名不同发起人的精确匹配
+        channels_activity_id = kwargs.get("channels_activity_id", "")
+        # 视频号视频标注(平台级):所有选项(含「无需标注」)都会去页面下拉真正选中
+        channels_mark_tag = kwargs.get("channels_mark_tag", "无需标注")
+        # 自行拍摄联动:拍摄时间(YYYY-MM-DD 字符串)+ 拍摄地点([国家, 省, 市] 文本数组)
+        channels_shoot_date = kwargs.get("channels_shoot_date", "")
+        channels_shoot_region = kwargs.get("channels_shoot_region", []) or []
+        # 转载联动:转载来源(选填文本)
+        channels_repost_source = kwargs.get("channels_repost_source", "")
+        # 视频号剧集(账号级,值是 [{key,title,cover,extinfo,sourceLeft,sourceRight,trace}])
+        channels_drama = kwargs.get("channels_drama", []) or []
+        # 链接类型(''/article/red_envelope/drama/mini_drama)+ 公众号文章/红包封面链接
+        channels_link_type = kwargs.get("channels_link_type", "") or ""
+        channels_link_article_url = kwargs.get("channels_link_article_url", "") or ""
+        channels_red_envelope_url = kwargs.get("channels_red_envelope_url", "") or ""
 
         # 打印发布参数摘要
         logger.info("[发布参数] 标题: %s", title)
@@ -1172,6 +1667,7 @@ class ChannelsPlatform(BasePlatform):
                         # 有头模式发布(便于观察);不开 humanize(no_viewport=True 与
                         # 拟人化鼠标轨迹冲突,会抛 "Viewport size not available")
                         browser = await self.create_browser(headless=False)
+                        keep_browser_open = False  # DRY_RUN 模拟发布成功后保留浏览器窗口
                         try:
                             context = await self.create_context(
                                 browser, storage_state=cookie_path
@@ -1197,7 +1693,29 @@ class ChannelsPlatform(BasePlatform):
                             await _fill_title_and_tags(page, title, tags)
                             await _apply_collection(page, channels_collection_name)
                             await _apply_location(page, channels_location_name)
+                            await _apply_activity(page, channels_activity_name, channels_activity_id)
                             await _apply_original_statement(page, category)
+                            await _apply_mark_tag(
+                                page,
+                                channels_mark_tag,
+                                channels_shoot_date,
+                                channels_shoot_region,
+                                channels_repost_source,
+                            )
+
+                            # 关联链接:剧集(drama/mini_drama) / 公众号文章 / 红包封面
+                            # (页面在上传中即可设置,提前到等上传完成之前处理,节省总耗时)
+                            if channels_drama:
+                                await _link_drama(page, channels_drama)
+                            elif channels_link_type == "article" and channels_link_article_url:
+                                await _link_url(page, "article", channels_link_article_url)
+                            elif channels_link_type == "red_envelope" and channels_red_envelope_url:
+                                await _link_url(page, "red_envelope", channels_red_envelope_url)
+                            elif channels_link_type in ("article", "red_envelope"):
+                                logger.warning(
+                                    "[链接] linkType=%s 但链接 URL 为空,跳过设置",
+                                    channels_link_type,
+                                )
 
                             # Wait for upload to finish (auto-retries on error)
                             await _wait_for_upload_complete(page, file_path)
@@ -1223,20 +1741,30 @@ class ChannelsPlatform(BasePlatform):
                             logger.info("[发布调试] 竖版封面(portrait) : %s", thumbnail_portrait_path or "(无)")
                             logger.info("[发布调试] 合集(collection)  : %s", channels_collection_name or "(无)")
                             logger.info("[发布调试] 位置(location)     : %s", channels_location_name or "(无)")
+                            logger.info("[发布调试] 活动(activity)     : %s (id=%s)", channels_activity_name or "(无)", channels_activity_id or "(无)")
                             logger.info("[发布调试] 创作声明(category): %s", category or "(无)")
+                            logger.info("[发布调试] 视频标注(mark_tag) : %s", channels_mark_tag or "(无)")
+                            logger.info("[发布调试] 拍摄时间(shoot_dt): %s", channels_shoot_date or "(无)")
+                            logger.info("[发布调试] 拍摄地点(shoot_rg): %s", " / ".join(channels_shoot_region) if channels_shoot_region else "(无)")
+                            logger.info("[发布调试] 转载来源(repost)   : %s", channels_repost_source or "(无)")
+                            if channels_drama:
+                                d = channels_drama[0]
+                                logger.info("[发布调试] 关联剧集(drama)    : %s (%s) key=%s", d.get("title", "(无)"), d.get("extinfo", ""), d.get("key", ""))
+                            else:
+                                logger.info("[发布调试] 关联剧集(drama)    : (无)")
+                            logger.info("[发布调试] 链接(link)       : type=%s article=%s red_envelope=%s", channels_link_type or "(无)", channels_link_article_url or "(无)", channels_red_envelope_url or "(无)")
                             logger.info("[发布调试] 定时(enable_timer): %s", enable_timer)
                             logger.info("[发布调试] ========================================")
                             logger.info("=" * 60)
 
                             if _PUBLISH_DRY_RUN:
-                                logger.warning("[发布调试] DRY_RUN 已开启 —— 跳过实际点击发布,流程到此结束(不发布)")
-                                logger.info("[发布调试] DRY_RUN: 浏览器保持打开,等待你手动关闭窗口后再结束...")
-                                try:
-                                    while browser.is_connected():
-                                        await asyncio.sleep(1)
-                                    logger.info("[发布调试] 检测到浏览器已关闭,流程结束")
-                                except Exception:
-                                    pass
+                                # 模拟发布成功: 不真实点击「发表」,打成功日志即算发布完成;
+                                # 浏览器停留在发布界面(不自动关窗),人工检查表单后手动关闭。
+                                # 立即 return 让任务记为成功,不阻塞等关窗(避免和 watchdog
+                                # 竞争把「手动关窗」误判为取消失败)。
+                                logger.info("[发布] ✅ DRY_RUN 模拟发布成功(未真实点击「发表」)")
+                                logger.info("[发布] DRY_RUN: 浏览器停留在发布界面,请人工检查表单后手动关闭窗口")
+                                keep_browser_open = True
                                 return
 
                             # Submit
@@ -1246,14 +1774,18 @@ class ChannelsPlatform(BasePlatform):
                             await context.storage_state(path=cookie_path)
                             logger.info("[发布] Cookie状态已更新")
                         finally:
-                            try:
-                                await context.close()
-                            except Exception:
-                                pass
-                            try:
-                                await browser.close()
-                            except Exception:
-                                pass
+                            if keep_browser_open:
+                                # DRY_RUN: 保留浏览器窗口在发布页,跳过收尾
+                                logger.info("[发布] DRY_RUN: 跳过浏览器收尾,窗口停留在发布界面")
+                            else:
+                                try:
+                                    await context.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    await self.close_browser(browser, is_close_by_code=True)
+                                except Exception:
+                                    pass
 
         asyncio.run(_do_upload())
 

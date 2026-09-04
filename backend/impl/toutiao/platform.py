@@ -11,6 +11,7 @@
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -23,6 +24,7 @@ from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
     parse_schedule_time,
+    raise_if_page_closed,
     save_login_result,
     scrape_toutiao_profile,
 )
@@ -35,6 +37,44 @@ class ToutiaoPlatform(BasePlatform):
     platform_id = 13
     platform_key = "toutiao"
     platform_name = "今日头条"
+
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    # 头条 cookie 全部由 mp.toutiao.com / sso.toutiao.com 下发，
+    # 通配 .toutiao.com 后对创作中心和子域都生效。
+    platform_cookie_domain = ".toutiao.com"
+
+    def _parse_cookie_to_storage_state(
+        self, cookie_str: str
+    ) -> tuple[list[dict], list[dict]]:
+        """把 'k=v; k=v' 解析为 Playwright storage_state 的 (cookies, origins)。
+
+        - 全部 cookie 归属 ``platform_cookie_domain`` (.toutiao.com)
+        - expires 给 7 天保守占位，sync_profile 跑完后 storage_state 会被
+          回写为真实的 cookie（含真实 expires + localStorage）
+        - localStorage 留空，由 sync_profile 自然补全
+        """
+        cookies: list[dict] = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": self.platform_cookie_domain,
+                "path": "/",
+                "expires": expires,
+                "httpOnly": True,
+                "secure": False,
+                "sameSite": "Lax",
+            })
+        logger.info(
+            f"[toutiao] cookie 解析: {len(cookies)} 条, domain={self.platform_cookie_domain}"
+        )
+        return cookies, []
 
     # ------------------------------------------------------------------
     # login — QR code scan via CloakBrowser
@@ -91,6 +131,7 @@ class ToutiaoPlatform(BasePlatform):
                 max_wait = 300  # 5 minutes
                 start_time = asyncio.get_event_loop().time()
                 while (asyncio.get_event_loop().time() - start_time) < max_wait:
+                    raise_if_page_closed(page)
                     try:
                         current_url = page.url
                         if "auth/page/login" not in current_url and "profile_v4" in current_url:
@@ -114,6 +155,9 @@ class ToutiaoPlatform(BasePlatform):
                     status_queue=status_queue,
                     scrape_fn=scrape_toutiao_profile,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(粉丝数/总阅读量/累计收益),
+                    # 与 sync_profile 共用同一份抓取逻辑
+                    stats_fn=self._login_stats_fn,
                 )
                 logger.info("[登录] 登录流程完成!")
                 success = True
@@ -159,8 +203,17 @@ class ToutiaoPlatform(BasePlatform):
     # sync_profile — refresh user name / avatar
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Toutiao creator centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """同步头条昵称、头像、运营数据(stats)。
+
+        创作中心首页 (https://mp.toutiao.com/profile_v4/index) 有一个
+        .data-board 区块,内含 3 个 .data-board-item:
+          - .data-board-item-title  标题(嵌在 svg 间的文字)
+          - .data-board-item-primary 主数值(<a> 文本)
+          - .data-board-item-secondary 昨日变化
+
+        3 项 stats: 粉丝数 / 总阅读(播放)量 / 累计收益
+        """
         logger.info("[同步资料] 开始同步用户资料: %s", cookie_file)
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         browser = await self.create_browser(headless=True)
@@ -177,13 +230,114 @@ class ToutiaoPlatform(BasePlatform):
                 except Exception:
                     pass
                 await asyncio.sleep(3)
+                # 抓 name/avatar(用原有 scraper)
                 name, avatar = await scrape_toutiao_profile(page)
-                logger.info("[同步资料] 获取到用户信息 - 昵称: %s, 头像: %s", name, avatar[:50] if avatar else "无")
-                return name, avatar
+                logger.info(
+                    "[同步资料] 获取到用户信息 - 昵称: %s, 头像: %s",
+                    name, avatar[:50] if avatar else "无"
+                )
+
+                # 抓 stats(3 项 .data-board-item)
+                try:
+                    await page.wait_for_selector(".data-board-item", timeout=8000)
+                except Exception:
+                    logger.info("[toutiao stats] 等待 .data-board-item 超时")
+
+                result = await page.evaluate(
+                    '''() => {
+                        const out = [];
+                        document.querySelectorAll('.data-board-item').forEach(item => {
+                            // 标题: 嵌在 svg 里,textContent 自动剥离 svg 内容
+                            const titleEl = item.querySelector('.data-board-item-title');
+                            // 主数值: <a> 里的文本
+                            const primaryEl = item.querySelector('.data-board-item-primary');
+                            if (!titleEl || !primaryEl) return;
+                            // title 可能含 svg + 真实文字 + svg(问号图标)
+                            // 我们想要的是 svg 后面的真实文字(粉丝数/总阅读(播放)量/累计收益)
+                            const title = (titleEl.textContent || '').trim();
+                            const num = (primaryEl.textContent || '').trim();
+                            if (title && num) {
+                                out.push({title, num});
+                            }
+                        });
+                        return out;
+                    }'''
+                )
+
+                # label_map: 标题文 -> (ICON, SORT, 标准化 NAME)
+                label_map = {
+                    "粉丝数":        ("user",   1, "粉丝数"),
+                    "总阅读(播放)量": ("play",   2, "总阅读(播放)量"),
+                    "累计收益":       ("coin",   3, "累计收益"),
+                }
+                stats = []
+                for item in (result or []):
+                    title = item.get('title', '')
+                    num_str = str(item.get('num', '0'))
+                    if title in label_map:
+                        icon, sort_no, std_name = label_map[title]
+                        # 累计收益值形如 "0元" 或 "6,275";去掉"元"和千分位逗号
+                        cleaned = num_str.replace('元', '').replace(',', '').replace(' ', '').strip()
+                        try:
+                            count = int(float(cleaned)) if '.' in cleaned else int(cleaned) if cleaned else 0
+                        except (ValueError, TypeError):
+                            count = 0
+                        stats.append({"ICON": icon, "COUNT": count, "NAME": std_name, "SORT": sort_no})
+
+                if not name and not avatar and not stats:
+                    logger.info(f"[toutiao] sync_profile 抓取为空,url={page.url}")
+
+                return {"name": name, "avatar": avatar, "stats": stats}
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用同一份 evaluate 抓取逻辑,
+        但 login 路径下旧 scrape_toutiao_profile 已经写过 name/avatar,
+        这里只抓 stats 即可。
+        """
+        try:
+            await page.wait_for_selector(".data-board-item", timeout=8000)
+        except Exception:
+            logger.info("[toutiao login] 等待 .data-board-item 超时")
+
+        result = await page.evaluate(
+            '''() => {
+                const out = [];
+                document.querySelectorAll('.data-board-item').forEach(item => {
+                    const titleEl = item.querySelector('.data-board-item-title');
+                    const primaryEl = item.querySelector('.data-board-item-primary');
+                    if (!titleEl || !primaryEl) return;
+                    const title = (titleEl.textContent || '').trim();
+                    const num = (primaryEl.textContent || '').trim();
+                    if (title && num) out.push({title, num});
+                });
+                return out;
+            }'''
+        )
+
+        label_map = {
+            "粉丝数":        ("user",   1, "粉丝数"),
+            "总阅读(播放)量": ("play",   2, "总阅读(播放)量"),
+            "累计收益":       ("coin",   3, "累计收益"),
+        }
+        stats = []
+        for item in (result or []):
+            title = item.get('title', '')
+            num_str = str(item.get('num', '0'))
+            if title in label_map:
+                icon, sort_no, std_name = label_map[title]
+                cleaned = num_str.replace('元', '').replace(',', '').replace(' ', '').strip()
+                try:
+                    count = int(float(cleaned)) if '.' in cleaned else int(cleaned) if cleaned else 0
+                except (ValueError, TypeError):
+                    count = 0
+                stats.append({"ICON": icon, "COUNT": count, "NAME": std_name, "SORT": sort_no})
+        return stats
 
     # ------------------------------------------------------------------
     # open_creator_center — visible browser window
@@ -242,6 +396,9 @@ class ToutiaoPlatform(BasePlatform):
         schedule_time_str = kwargs.get("schedule_time_str", "")
         thumbnail_landscape_path = kwargs.get("thumbnail_landscape_path", "")
         thumbnail_portrait_path = kwargs.get("thumbnail_portrait_path", "")
+        # 16:9 / 9:16 次尺寸封面(头条横版视频用 16:9,竖版视频用 9:16)
+        thumbnail_landscape_169_path = kwargs.get("thumbnail_landscape_169_path", "")
+        thumbnail_portrait_916_path = kwargs.get("thumbnail_portrait_916_path", "")
         creation_declaration = kwargs.get("creation_declaration", "") or ""
         enable_generate_image = kwargs.get("enable_generate_image", True)
         collection_id = kwargs.get("collection_id", "")
@@ -274,6 +431,8 @@ class ToutiaoPlatform(BasePlatform):
         logger.info("[发布参数] 扩展链接: %s (URL: %s)", extend_link, extend_link_url or "无")
         logger.info("[发布参数] 横版封面: %s", thumbnail_landscape_path or "无")
         logger.info("[发布参数] 竖版封面: %s", thumbnail_portrait_path or "无")
+        logger.info("[发布参数] 横版16:9封面: %s", thumbnail_landscape_169_path or "无")
+        logger.info("[发布参数] 竖版9:16封面: %s", thumbnail_portrait_916_path or "无")
 
         # Resolve full paths
         account_paths = [str(Path(BASE_DIR / "cookiesFile" / f)) for f in account_file]
@@ -282,6 +441,10 @@ class ToutiaoPlatform(BasePlatform):
             thumbnail_landscape_path = str(thumbnail_landscape_path)
         if thumbnail_portrait_path:
             thumbnail_portrait_path = str(thumbnail_portrait_path)
+        if thumbnail_landscape_169_path:
+            thumbnail_landscape_169_path = str(thumbnail_landscape_169_path)
+        if thumbnail_portrait_916_path:
+            thumbnail_portrait_916_path = str(thumbnail_portrait_916_path)
 
         # Determine publish strategy and schedule times
         publish_strategy = "scheduled" if enableTimer and schedule_time_str else "immediate"
@@ -316,6 +479,8 @@ class ToutiaoPlatform(BasePlatform):
                         desc=desc,
                         thumbnail_landscape_path=thumbnail_landscape_path or None,
                         thumbnail_portrait_path=thumbnail_portrait_path or None,
+                        thumbnail_landscape_169_path=thumbnail_landscape_169_path or None,
+                        thumbnail_portrait_916_path=thumbnail_portrait_916_path or None,
                         creation_declaration=creation_declaration,
                         enable_generate_image=enable_generate_image,
                         collection_id=collection_id,
@@ -343,6 +508,8 @@ class ToutiaoPlatform(BasePlatform):
         desc="",
         thumbnail_landscape_path=None,
         thumbnail_portrait_path=None,
+        thumbnail_landscape_169_path=None,
+        thumbnail_portrait_916_path=None,
         creation_declaration=None,
         enable_generate_image=True,
         collection_id="",
@@ -379,6 +546,7 @@ class ToutiaoPlatform(BasePlatform):
                 upload_complete = False
                 last_progress = ""
                 while (asyncio.get_event_loop().time() - start_time) < max_wait:
+                    raise_if_page_closed(page)
                     try:
                         success_text = page.locator('span.percent:has-text("上传成功")')
                         if await success_text.count():
@@ -479,10 +647,16 @@ class ToutiaoPlatform(BasePlatform):
                     logger.info("[填写标签] 无标签")
 
                 # Set thumbnail/cover
-                if thumbnail_landscape_path or thumbnail_portrait_path:
+                if (thumbnail_landscape_path or thumbnail_portrait_path
+                        or thumbnail_landscape_169_path or thumbnail_portrait_916_path):
                     logger.info("[设置封面] 开始设置封面...")
                     await self._set_thumbnail(
-                        page, thumbnail_landscape_path, thumbnail_portrait_path, is_portrait
+                        page,
+                        thumbnail_landscape_path,
+                        thumbnail_portrait_path,
+                        thumbnail_landscape_169_path,
+                        thumbnail_portrait_916_path,
+                        is_portrait,
                     )
                     logger.info("[设置封面] 封面设置完成")
                 else:
@@ -548,7 +722,7 @@ class ToutiaoPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: fill tags
@@ -607,9 +781,25 @@ class ToutiaoPlatform(BasePlatform):
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _set_thumbnail(page, thumbnail_landscape_path=None, thumbnail_portrait_path=None, is_portrait=False):
-        """Set video cover/thumbnail."""
-        if not thumbnail_landscape_path and not thumbnail_portrait_path:
+    async def _set_thumbnail(
+        page,
+        thumbnail_landscape_path=None,
+        thumbnail_portrait_path=None,
+        thumbnail_landscape_169_path=None,
+        thumbnail_portrait_916_path=None,
+        is_portrait=False,
+    ):
+        """Set video cover/thumbnail.
+
+        封面尺寸选择策略(按视频方向):
+        - 横版视频 → 优先 16:9 横封面(thumbnail_landscape_169_path),
+                    没有则回退到 4:3 横封面(thumbnail_landscape_path)
+        - 竖版视频 → 优先 9:16 竖封面(thumbnail_portrait_916_path),
+                    没有则回退到 3:4 竖封面(thumbnail_portrait_path)
+        两者都为空才跳过。
+        """
+        if (not thumbnail_landscape_path and not thumbnail_portrait_path
+                and not thumbnail_landscape_169_path and not thumbnail_portrait_916_path):
             return
 
         logger.info("[封面] 开始设置视频封面")
@@ -635,35 +825,122 @@ class ToutiaoPlatform(BasePlatform):
             if not await cover_input.count():
                 cover_input = page.locator('input[type="file"]').first
 
-            # Choose the right thumbnail based on orientation
-            thumb_path = thumbnail_portrait_path if is_portrait else thumbnail_landscape_path
-            if not thumb_path:
-                thumb_path = thumbnail_portrait_path or thumbnail_landscape_path
+            # 按视频方向优先选 16:9 / 9:16 新尺寸,没有才回退到 4:3 / 3:4
+            if is_portrait:
+                thumb_path = (thumbnail_portrait_916_path
+                              or thumbnail_portrait_path
+                              or thumbnail_landscape_path)
+                size_label = "9:16 竖封面" if thumbnail_portrait_916_path else "3:4 竖封面(回退)"
+            else:
+                thumb_path = (thumbnail_landscape_169_path
+                              or thumbnail_landscape_path
+                              or thumbnail_portrait_path)
+                size_label = "16:9 横封面" if thumbnail_landscape_169_path else "4:3 横封面(回退)"
 
-            logger.info("[封面] 上传封面图片: %s", thumb_path)
+            logger.info("[封面] 上传封面图片[%s]: %s", size_label, thumb_path)
             await cover_input.set_input_files(thumb_path)
             await asyncio.sleep(2)
 
-            # Check if "完成裁剪" button appears and click it
-            clip_btn = page.locator('.clip-btn:has-text("完成裁剪")')
-            if await clip_btn.count():
-                await clip_btn.click()
-                await asyncio.sleep(1)
-                logger.info("[封面] 已点击完成裁剪")
+            # 上传后头条会进入裁剪/预览页,依次尝试点击「完成裁剪」「确定」按钮。
+            # 注意:不能用 class 定位(antd/头条自有 hash 会漂移),改用
+            # button + 文字精确定位 + role=button 兜底。
+            #
+            # 规则:如果上传的图片就是头条规定比例(16:9 / 9:16),
+            # 头条不会弹「完成裁剪」,直接显示「确定」→ 这时必须立刻跳过
+            # 「完成裁剪」步骤,不能傻等。
+            async def _click_btn_by_text(text, wait_timeout_ms=5000):
+                """按可见文字点击按钮(button / [role=button]),不依赖 class。
 
-            # Click confirm button
-            confirm_btn = page.locator('button.btn-sure:has-text("确定")')
-            if await confirm_btn.count():
-                await confirm_btn.click()
-                await asyncio.sleep(2)
-                logger.info("[封面] 已点击确定")
+                先用 count() 毫秒级探测元素是否存在,不存在立即返回 False
+                (避免 wait_for 把整个 timeout 浪费在等一个不会出现的按钮上)。
+                存在才 wait_for + click。返回 True/False。
+                """
+                candidates = [
+                    f"button:has-text('{text}')",
+                    f"[role='button']:has-text('{text}')",
+                ]
+                for sel in candidates:
+                    loc = page.locator(sel).first
+                    # 毫秒级探测:不存在直接跳下一个,不浪费时间
+                    if await loc.count() == 0:
+                        continue
+                    try:
+                        await loc.wait_for(state="visible", timeout=wait_timeout_ms)
+                        if await loc.is_enabled():
+                            await loc.click(timeout=wait_timeout_ms)
+                            logger.info("[封面] 已点击「%s」(选择器=%s)", text, sel)
+                            return True
+                    except Exception:
+                        continue
+                logger.info("[封面] 未找到「%s」按钮,跳过", text)
+                return False
 
-            # Handle confirmation dialog if it appears
-            confirm_dialog = page.locator('.m-button.red:has-text("确定")')
-            if await confirm_dialog.count():
-                await confirm_dialog.click()
+            # 1. 完成裁剪(可选):图片符合规定比例时不会出现,直接跳过
+            #    用 count() 探测,不存在立即跳过,不会卡 3 秒
+            if await page.locator("button:has-text('完成裁剪')").count() > 0:
+                await _click_btn_by_text("完成裁剪", wait_timeout_ms=5000)
                 await asyncio.sleep(1)
-                logger.info("[封面] 确认对话框已处理")
+            else:
+                logger.info("[封面] 未出现「完成裁剪」(图片符合规定比例),直接点确定")
+
+            # 2. 确定(必点,关闭封面编辑弹窗)
+            ok = await _click_btn_by_text("确定", wait_timeout_ms=8000)
+            if not ok:
+                logger.warning("[封面] 未点到「确定」按钮,封面可能未生效")
+            await asyncio.sleep(2)
+
+            # 3. 二次确认对话框(可选)
+            #    DOM 结构(用户提供的真实 DOM):
+            #      <div class="m-xigua-dialog m-modal m-dialog-edit">  ← 弹窗容器
+            #        <div class="mask"></div>                          ← 遮罩
+            #        <div class="m-content">
+            #          <svg class="close">...</svg>
+            #          <div class="content">
+            #            <div class="body">完成后无法继续编辑,是否确定完成？</div>
+            #            <div class="footer">
+            #              <button class="m-button">取消</button>
+            #              <button class="m-button red">确定</button>   ← 要点这个
+            #            </div>
+            #          </div>
+            #        </div>
+            #      </div>
+            #
+            # 定位策略(全程不依赖 class):
+            # 1) 先用 body 文字"完成后无法继续编辑"找到对话框(产品文案稳定)
+            # 2) 在该对话框范围内找 footer 里第 2 个 button(第 1 个是取消,第 2 个是确定)
+            #    不能用 button:has-text('确定') —— 主弹窗也含同名按钮会误匹配
+            # 3) 直接用 force=True 点击(避免被遮罩层/动画拦截)
+            try:
+                # 用 XPath 精确定位二次确认弹窗的「确定」按钮:
+                # 1) 找同时含「完成后无法继续编辑」+「取消」+「确定」的元素(会匹配祖先链)
+                # 2) 排除有更深层匹配的祖先(not(.//*[...])),只留最深一层的弹窗容器
+                #    避免 Playwright 把 <html>/<body> 当匹配导致点中遮罩层
+                # 3) 在该容器内定位同时含「取消」「确定」的 footer 的确定按钮
+                #    (主弹窗只有「确定」无「取消」,不会误匹配)
+                cond = (
+                    ".//*[contains(normalize-space(.), '完成后无法继续编辑')] "
+                    "and .//button[normalize-space()='取消'] "
+                    "and .//button[normalize-space()='确定']"
+                )
+                dialog_ok_btn = page.locator(
+                    f"xpath=//*[{cond} and not(.//*[{cond}])]"
+                    "//div[button[normalize-space()='取消'] "
+                    "and button[normalize-space()='确定']]"
+                    "//button[normalize-space()='确定']"
+                ).first
+                if await dialog_ok_btn.count() > 0:
+                    try:
+                        await dialog_ok_btn.wait_for(state="visible", timeout=5000)
+                    except Exception:
+                        # 弹窗动画中可能 is_visible=False,继续 force click
+                        pass
+                    await dialog_ok_btn.click(force=True, timeout=5000)
+                    logger.info("[封面] 已点击二次确认弹窗「确定」")
+                    await asyncio.sleep(1)
+                else:
+                    logger.info("[封面] 未出现二次确认弹窗,流程结束")
+            except Exception as e:
+                logger.warning("[封面] 二次确认弹窗处理失败: %s", e)
 
             logger.info("[封面] 封面设置完成")
         except Exception as e:

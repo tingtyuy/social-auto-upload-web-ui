@@ -28,6 +28,7 @@ hash 类名会随构建漂移)。本实现优先用 placeholder / role / text / 
 import asyncio
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
@@ -40,6 +41,7 @@ from .._browser import create_browser_sync, create_context_sync
 from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
+    raise_if_page_closed,
     save_login_result,
     scrape_alipay_profile,
 )
@@ -69,6 +71,25 @@ class AlipayPlatform(BasePlatform):
     platform_id = 12
     platform_key = "alipay"
     platform_name = "支付宝"
+
+    # 支持 cookie 字符串导入账号（支付宝登录态依赖 ctoken 等动态字段 + localStorage，
+    # 仅灌 cookie 可能拉不到资料，需用户自行验证）
+    supports_cookie_import = True
+    platform_cookie_domain = ".alipay.com"
+
+    def _parse_cookie_to_storage_state(self, cookie_str):
+        cookies = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair: continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(), "value": value.strip(),
+                "domain": self.platform_cookie_domain, "path": "/",
+                "expires": expires, "httpOnly": True, "secure": False, "sameSite": "Lax",
+            })
+        return cookies, []
 
     # ------------------------------------------------------------------
     # login()
@@ -110,6 +131,9 @@ class AlipayPlatform(BasePlatform):
                     status_queue=status_queue,
                     scrape_fn=scrape_alipay_profile,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(粉丝/获赞),
+                    # 与 sync_profile 共用同一份抓取逻辑
+                    stats_fn=self._login_stats_fn,
                 )
                 success = True
             finally:
@@ -188,8 +212,12 @@ class AlipayPlatform(BasePlatform):
     # sync_profile()
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """同步昵称 + 头像。"""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """同步昵称 + 头像 + 运营数据(stats)。
+
+        访问 https://c.alipay.com/page/life-account/index,同一个 DOM 里同时抓
+        name/avatar 和 stats(粉丝/获赞)。
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         url = _ALIPAY_CREATOR_URL
 
@@ -199,14 +227,91 @@ class AlipayPlatform(BasePlatform):
             page = await context.new_page()
             try:
                 await page.goto(url, wait_until="networkidle", timeout=30000)
-                return await scrape_alipay_profile(page)
+                name, avatar = await scrape_alipay_profile(page)
+                # stats 与 name/avatar 在同一个 DOM 区块(.numBox),不用 goto 第二次
+                stats = await self._scrape_alipay_stats(page)
+                return {"name": name, "avatar": avatar, "stats": stats}
             except Exception as e:
                 logger.info(f"[alipay] 同步资料失败: {e}")
-                return "", ""
+                return {"name": "", "avatar": "", "stats": []}
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+    async def _scrape_alipay_stats(self, page) -> list:
+        """抓取支付宝创作中心 .numBox 区块里的运营数据。
+
+        页面 DOM 结构(参见用户提供的 2026-07-21 抓取样本):
+            <div class="numBox___BlEq0">
+                <span class="cntBox___HEIqZ">粉丝<span class="cnt___PTXo2">0</span></span>
+                <span class="cntBox___HEIqZ">获赞<span class="cnt___PTXo2">0</span></span>
+                <div class="ant-divider ant-divider-vertical" role="separator"></div>
+                <div class="appId___lVu45">生活号ID:...</div>
+            </div>
+
+        每块 .cntBox 包含一个中文 label + 一个 .cnt 数值 span。
+
+        Returns:
+            list[dict]: 按 SORT 排序的运营数据列表
+        """
+        stats = []
+        # label_map: 区块里的纯文本 label -> (ICON, SORT, 标准化 NAME)
+        label_map = {
+            "粉丝": ("user", 1, "粉丝"),
+            "获赞": ("like", 2, "获赞"),
+        }
+
+        try:
+            try:
+                await page.wait_for_selector(".cntBox___HEIqZ, [class*='cntBox_']", timeout=8000)
+            except Exception:
+                logger.info("[alipay stats] 等待 .cntBox 超时")
+
+            raw = await page.evaluate(
+                '''() => {
+                    const out = [];
+                    // CSS modules class 名带 hash,用属性选择器更稳:[class*="cntBox_"]
+                    document.querySelectorAll('[class*="cntBox_"]').forEach(item => {
+                        // 数值 span:[class*="cnt_"] 开头(排除 cntBox_)
+                        const numEl = item.querySelector('[class^="cnt_"]:not([class*="cntBox_"])');
+                        if (!numEl) return;
+                        // label 是 .cntBox 里的纯文本节点(去掉嵌套 span 后)
+                        const clone = item.cloneNode(true);
+                        clone.querySelectorAll('span').forEach(s => s.remove());
+                        const label = (clone.textContent || '').trim();
+                        const num = (numEl.textContent || '').trim();
+                        if (label && num) out.push({label, num});
+                    });
+                    return out;
+                }'''
+            )
+
+            for item in raw:
+                label = item.get('label', '')
+                if label in label_map:
+                    icon, sort_no, name = label_map[label]
+                    try:
+                        count = int(str(item.get('num', '0')).replace(',', '').replace(' ', '') or '0')
+                    except (ValueError, TypeError):
+                        count = 0
+                    stats.append({"ICON": icon, "COUNT": count, "NAME": name, "SORT": sort_no})
+        except Exception as exc:
+            logger.info(f"[alipay stats] 抓取失败: {exc}")
+
+        stats.sort(key=lambda x: x.get("SORT", 999))
+        return stats
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用 _scrape_alipay_stats 抓取逻辑。
+        """
+        try:
+            return await self._scrape_alipay_stats(page)
+        except Exception as exc:
+            logger.info(f"[alipay login] _login_stats_fn 抓取失败: {exc}")
+            return []
 
     # ------------------------------------------------------------------
     # publish_video -- sync entry point
@@ -226,6 +331,7 @@ class AlipayPlatform(BasePlatform):
         - ``author_statement`` (*str*) — 作者声明(必填,6 选 1)
         - ``compilation`` (*str*)  — 合集名称(可选,精确匹配)
         - ``enableTimer`` (*bool*) / ``schedule_time_str`` (*str*) — 定时发布
+        - ``reprint_url`` (*str*)  — 转载来源地址(author_statement=内容为转载 时必填)
         """
         asyncio.run(self._upload_all(**kwargs))
         return True
@@ -257,6 +363,7 @@ class AlipayPlatform(BasePlatform):
         compilation = kwargs.get("compilation", "") or ""
         enable_timer = kwargs.get("enableTimer")
         schedule_time_str = kwargs.get("schedule_time_str", "") or ""
+        reprint_url = kwargs.get("reprint_url", "") or ""
 
         # 打印发布参数摘要
         logger.info("[发布参数] 标题: %s", title)
@@ -268,6 +375,7 @@ class AlipayPlatform(BasePlatform):
         logger.info("[发布参数] 竖版封面: %s", thumbnail_portrait_path or "无")
         logger.info("[发布参数] 视频格式: %s", video_format or "未指定")
         logger.info("[发布参数] 作者声明: %s", author_statement or "无")
+        logger.info("[发布参数] 转载来源: %s", reprint_url or "无")
         logger.info("[发布参数] 合集: %s", compilation or "无")
         logger.info("[发布策略] 发布策略: %s", "scheduled" if enable_timer and schedule_time_str else "immediate")
 
@@ -301,6 +409,7 @@ class AlipayPlatform(BasePlatform):
                         compilation=compilation,
                         enable_timer=enable_timer,
                         schedule_time_str=schedule_time_str,
+                        reprint_url=reprint_url,
                     )
 
         logger.info("=" * 60)
@@ -448,7 +557,7 @@ class AlipayPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper (image): upload multiple images via hidden input[type=file]
@@ -615,6 +724,7 @@ class AlipayPlatform(BasePlatform):
         ).first
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             try:
                 if await title_input.is_visible():
                     logger.info("[上传图集] 表单已可交互(标题输入框可见)")
@@ -798,6 +908,7 @@ class AlipayPlatform(BasePlatform):
         compilation: str = "",
         enable_timer=None,
         schedule_time_str: str = "",
+        reprint_url: str = "",
     ):
         """单个视频上传到单个账号的完整流程。"""
         # 打印完整上送参数,便于排查(与其他渠道日志风格一致)
@@ -815,6 +926,7 @@ class AlipayPlatform(BasePlatform):
             "  compilation=%r\n"
             "  enable_timer=%r\n"
             "  schedule_time_str=%r\n"
+            "  reprint_url=%r\n"
             "========================",
             title, file_path, tags,
             os.path.basename(account_file),
@@ -826,6 +938,7 @@ class AlipayPlatform(BasePlatform):
             compilation,
             enable_timer,
             schedule_time_str,
+            reprint_url,
         )
         browser = await self.create_browser(headless=False)
         try:
@@ -856,24 +969,11 @@ class AlipayPlatform(BasePlatform):
                 # 4. 填描述 + 话题
                 await self._set_description_and_tags(page, desc, title, tags)
 
-                # 5. 上传封面(按视频格式选择对应封面)
-                #    竖版视频(portrait)→竖版封面;横版视频(landscape)→横版封面
-                #    未指定格式时横版优先兜底
-                if video_format == "portrait":
-                    cover_path = (
-                        thumbnail_portrait_path or thumbnail_landscape_path
-                    )
-                elif video_format == "landscape":
-                    cover_path = (
-                        thumbnail_landscape_path or thumbnail_portrait_path
-                    )
-                else:
-                    cover_path = (
-                        thumbnail_landscape_path or thumbnail_portrait_path
-                    )
+                # 5. 上传封面:固定用竖版封面(3:4 主尺寸,用户要求),
+                #    不再按视频格式区分;竖版缺失时横版兜底
+                cover_path = thumbnail_portrait_path or thumbnail_landscape_path
                 logger.info(
-                    "[上传视频] 封面选择: 格式=%s → %s",
-                    video_format or "未指定",
+                    "[上传视频] 封面选择: 固定竖版 → %s",
                     os.path.basename(cover_path) if cover_path else "无",
                 )
                 await self._set_cover(page, cover_path)
@@ -882,8 +982,10 @@ class AlipayPlatform(BasePlatform):
                 if compilation:
                     await self._set_compilation(page, compilation)
 
-                # 7. 作者声明(必填)
+                # 7. 作者声明(必填) + 转载来源(声明=内容为转载 时必填,下方出现输入框)
                 await self._set_author_statement(page, author_statement)
+                if author_statement.strip() == "内容为转载":
+                    await self._set_reprint_url(page, reprint_url)
 
                 # 8. 定时发布(可选)
                 if enable_timer and schedule_time_str:
@@ -902,7 +1004,7 @@ class AlipayPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: upload the video file via hidden input[type=file]
@@ -1010,6 +1112,7 @@ class AlipayPlatform(BasePlatform):
         )
         deadline = asyncio.get_event_loop().time() + 30
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             try:
                 count = await page.locator(marked_sel).count()
                 if count > 0:
@@ -1046,6 +1149,7 @@ class AlipayPlatform(BasePlatform):
         deadline = asyncio.get_event_loop().time() + timeout_s
 
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             try:
                 # 上传失败检测
                 if await page.get_by_text("上传失败", exact=True).count() > 0:
@@ -1127,7 +1231,8 @@ class AlipayPlatform(BasePlatform):
         await textarea.wait_for(state="visible", timeout=10000)
 
         # 先填描述正文(不含 #话题,话题单独走联想)
-        text = (desc or title or "").strip()
+        # 描述为空时不再回落标题，保持为空
+        text = (desc or "").strip()
         if text:
             await textarea.click()
             await asyncio.sleep(0.2)
@@ -1485,25 +1590,33 @@ class AlipayPlatform(BasePlatform):
     # Helper: set author statement (作者声明,必填)
     # ------------------------------------------------------------------
 
+    # 作者声明文本 → radio input value 映射(2026-07 实测 DOM)
+    # DOM: <input name="tagList" type="radio" value="..."> 6 选 1
+    # 注意:value 用后端业务码,不是中文,且各平台/版本会漂移,所以做双向兜底
+    _AUTHOR_STATEMENT_VALUE_MAP = {
+        "内容无需标注": "NO_STATEMENT",
+        "个人观点，仅供参考": "S_AT2",
+        "内容由AI生成": "A_AG3",
+        "内容虚构演绎，仅供娱乐": "S_AT1",
+        "内容含营销信息": "S_AT4",
+        "内容为转载": "S_AT3",
+    }
+
     @staticmethod
     async def _set_author_statement(page, statement: str):
-        """选择作者声明(必填,文档 ~/zfb.md 行 76-81)。
+        """选择作者声明(必填,6 选 1)。
 
-        6 个选项:内容无需标注 / 个人观点,仅供参考 / 内容由AI生成 /
-        内容虚构演绎,仅供娱乐 / 内容含营销信息 / 内容为转载
-
-        DOM(2026-06-24 实测):
-        - 搜索 input: ``input[id$='_tagList']`` (ID 有随机前缀,后缀稳定)
-          属性: role=combobox, readonly, aria-required=true
-        - select 容器: input 的祖先中 role=combobox 或含 arrow 的 div
-        - option: ``[role='option'][title="内容由AI生成"]`` (title 稳定)
+        DOM(2026-07 实测,作者声明已改为 radio group):
+        - radio: ``input[name="tagList"][type="radio"][value="..."]``
+          value 为业务码(NO_STATEMENT / S_AT1 / A_AG3 ...),稳定不漂移
+        - 标签文字(label.antd5-radio-label)是给用户看的,会变,不能用来定位
 
         **禁止用 class 定位**(antd5 + CSS modules hash 会漂移)。
 
         流程:
-        1. 通过 input[id$='_tagList'] 定位搜索框
-        2. 点其父级展开下拉
-        3. 点 [role='option'][title="..."] 精确匹配
+        1. 中文声明 → 业务码(映射表),映射不到时退回用 label 文字匹配
+        2. 点对应 radio(input click 会冒泡到 label 触发 antd 切换)
+        3. 等待被选中(antd5-radio-wrapper-checked / input.checked)
         """
         if not statement:
             logger.warning(
@@ -1511,59 +1624,143 @@ class AlipayPlatform(BasePlatform):
             )
             return
 
-        # 1. 通过 input[id$='_tagList'] 定位搜索框(input 有 role=combobox)
-        search_input = page.locator(
-            "input[id$='_tagList'][role='combobox']"
-        ).first
-        try:
-            await search_input.wait_for(state="visible", timeout=10000)
-        except Exception as e:
-            logger.warning("[上传视频] 未找到作者声明搜索框: %s", e)
-            return
+        statement = statement.strip()
+        value = AlipayPlatform._AUTHOR_STATEMENT_VALUE_MAP.get(statement)
 
-        # 2. 点搜索框展开下拉(它 readonly,点击会冒泡到父级 select 触发展开)
-        try:
-            await search_input.click()
-            await asyncio.sleep(0.8)
-            logger.info("[上传视频] 已点击作者声明搜索框,等待下拉")
-        except Exception as e:
-            logger.warning("[上传视频] 点击作者声明搜索框失败: %s", e)
-            return
+        # 1. 优先按 radio value 精确定位(value 是后端业务码,稳定)
+        if value:
+            radio = page.locator(
+                f"input[name='tagList'][type='radio'][value='{value}']"
+            ).first
+            try:
+                await radio.wait_for(state="attached", timeout=10000)
+                # antd5 受控 radio:直接 click 隐藏的 <input> 只会改 input.checked,
+                # 但不会触发 React onChange,导致 antd 内部状态不更新、视觉未选中。
+                # 必须点击包裹它的 <label>(可见、可点击,click 会正确冒泡触发 onChange)。
+                label = radio.locator("xpath=ancestor::label[1]")
+                is_checked = await radio.is_checked()
+                if not is_checked:
+                    await label.click()
+                    # 等 antd5 重新渲染:radio.checked=true + 父 label 加上
+                    # antd5-radio-wrapper-checked 类(转载来源输入框依赖此状态才出现)
+                    try:
+                        await page.wait_for_function(
+                            f"() => {{ const r = document.querySelector(\"input[name='tagList'][value='{value}']\"); return r && r.checked; }}",
+                            timeout=5000,
+                        )
+                    except Exception:
+                        # 状态没切换过来,补一次点击保险
+                        await label.click()
+                    await asyncio.sleep(0.5)
+                logger.info("[上传视频] 已选作者声明: %s (value=%s)", statement, value)
+                return
+            except Exception as e:
+                logger.warning(
+                    "[上传视频] 按 value=%s 定位作者声明 radio 失败: %s,回退到 label 匹配",
+                    value, e,
+                )
 
-        # 3. 等 option 渲染,点 title 精确匹配项
-        #    选项 DOM: <div aria-selected="false" title="内容由AI生成">...</div>
-        #    没有 role='option',只用 title 属性定位(稳定,不依赖 class)
-        target_opt = page.locator(
-            f"[title='{statement.strip()}']"
-        ).first
+        # 2. 兜底:label 文字匹配(label 可见文字,作为降级方案)
+        #    DOM: <label><input ...><span class="antd5-radio-label">内容由AI生成</span></label>
+        label_loc = page.locator(f"label:has(span:text-is('{statement}'))").first
         try:
-            await target_opt.wait_for(state="visible", timeout=10000)
-            await target_opt.click()
-            logger.info("[上传视频] 已选作者声明: %s", statement)
-            await asyncio.sleep(0.5)
+            await label_loc.wait_for(state="visible", timeout=8000)
+            await label_loc.click()
+            await asyncio.sleep(0.4)
+            logger.info("[上传视频] 已选作者声明(label 兜底): %s", statement)
             return
         except Exception as e:
             logger.warning(
-                "[上传视频] 未找到作者声明选项「%s」: %s", statement, e
+                "[上传视频] 未找到作者声明选项「%s」(value=%s): %s",
+                statement, value or "?", e,
             )
 
-        # 兜底:列出所有带 title 的下拉项辅助排查
+        # 排查辅助:列出当前所有 radio 的 value 与对应 label 文字
         try:
-            titles = await page.evaluate("""() => {
-                const holder = document.querySelector(".rc-virtual-list-holder-inner");
-                if (!holder) return [];
-                return Array.from(holder.children)
-                    .map(o => o.getAttribute('title'))
-                    .filter(Boolean);
+            options = await page.evaluate("""() => {
+                const radios = document.querySelectorAll("input[name='tagList'][type='radio']");
+                return Array.from(radios).map(r => {
+                    const label = r.closest("label");
+                    const txt = label ? (label.querySelector(".antd5-radio-label")?.textContent || "").trim() : "";
+                    return { value: r.value, label: txt, checked: r.checked };
+                });
             }""")
-            logger.info("[上传视频] 当前下拉可选项: %s", titles)
+            logger.info("[上传视频] 当前作者声明可选项: %s", options)
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Helper: set reprint url (转载来源地址,作者声明=内容为转载 时必填)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _set_reprint_url(page, reprint_url: str):
+        """填写转载来源地址(作者声明=内容为转载 时下方出现的输入框)。
+
+        DOM(2026-07 实测):
+        - 输入框: ``input[id$='_reprintUrl']`` (ID 有随机前缀,后缀稳定)
+        - 占位符: "请输入视频原地址"
+        - 仅在作者声明选中"内容为转载"后才会渲染出来
+
+        **禁止用 class 定位**(antd5 + CSS modules hash 会漂移)。
+
+        流程:
+        1. 等 reprintUrl input 可见(选完"内容为转载"后才会出现)
+        2. 清空 → 填入 reprint_url
+        """
+        if not reprint_url or not reprint_url.strip():
+            logger.warning(
+                "[上传视频] 转载来源地址为空,作者声明=内容为转载 时必填,发布会失败"
+            )
+            return
+
+        url = reprint_url.strip()
+        # 定位策略(按优先级):
+        # 1. input[id$='_reprintUrl'] - ID 后缀稳定,前缀随机
+        # 2. input[placeholder='请输入视频原地址'] - 占位符文案稳定
+        # 两个都不依赖 antd5 class
+        input_loc = page.locator("input[id$='_reprintUrl']").first
+
         try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
+            await input_loc.wait_for(state="visible", timeout=10000)
+        except Exception as e:
+            logger.warning("[上传视频] 按 id 后缀定位转载来源输入框失败: %s", e)
+            # 兜底:按 placeholder 精确匹配
+            input_loc = page.locator(
+                "input[placeholder='请输入视频原地址']"
+            ).first
+            try:
+                await input_loc.wait_for(state="visible", timeout=5000)
+                logger.info("[上传视频] 转载来源输入框改用 placeholder 兜底定位成功")
+            except Exception as e2:
+                logger.warning("[上传视频] placeholder 兜底也失败: %s", e2)
+                # 排查辅助:列出当前所有可见 input
+                try:
+                    all_inputs = await page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll("input"))
+                            .filter(i => i.offsetParent !== null)
+                            .map(i => ({
+                                id: i.id || "",
+                                name: i.name || "",
+                                type: i.type || "",
+                                placeholder: i.placeholder || "",
+                            }));
+                    }""")
+                    logger.info("[上传视频] 当前页面所有可见 input: %s", all_inputs)
+                except Exception:
+                    pass
+                return
+
+        try:
+            # 清空 → 填值(用 fill 触发 React onChange,不要用 type)
+            await input_loc.fill("")
+            await input_loc.fill(url)
+            # 触发失焦校验(antd5 会清掉"请输入视频原地址"错误态)
+            await input_loc.press("Tab")
+            await asyncio.sleep(0.3)
+            logger.info("[上传视频] 已填转载来源: %s", url)
+        except Exception as e:
+            logger.warning("[上传视频] 填写转载来源失败: %s", e)
 
     # ------------------------------------------------------------------
     # Helper: set schedule time (定时发布)
@@ -1702,6 +1899,7 @@ class AlipayPlatform(BasePlatform):
         modal_handled = False
 
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             # ---- 弹窗 1:「发布请注意」优化提示弹窗(antd5-modal) ----
             if not modal_handled:
                 try:

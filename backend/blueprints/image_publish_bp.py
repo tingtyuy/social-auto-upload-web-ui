@@ -187,6 +187,8 @@ def publish_images():
                 '快手': 4,
                 'weibo': 11, '微博': 11,   # 新增
                 'alipay': 12, '支付宝': 12,  # 图集发布
+                'vivo': 16, 'VIVO': 16,
+                'weixin_gzh': 17, '微信公众号': 17,  # 公众号贴图
             }
             platform_id = platform_map.get(platform_type)
             logger.info(f"[image_publish] platform_type={platform_type} -> platform_id={platform_id}")
@@ -230,10 +232,16 @@ def publish_images():
                 ai_content=config.get('aiContent', ''),
                 is_original=config.get('isOriginal', False),
                 activities=config.get('activities', []),
+                content_statement=config.get('contentStatement', ''),
+                content_statement2=config.get('contentStatement2', ''),
+                content_statement2_optional=config.get('contentStatement2Optional', ''),
                 author_declaration=config.get('aiContent', ''),
                 author_statement=config.get('author_statement', '') or config.get('authorStatement', ''),
                 music_id=config.get('music_id', ''),
                 music_title=config.get('music_title', ''),
+                # 微信公众号图集特有字段(视频发布侧用的 snake_case 此处补 camelCase 读取)
+                gzh_collection_name=config.get('gzhCollectionName', '') or config.get('gzh_collection_name', ''),
+                gzh_claim_source=config.get('gzhClaimSource', '') or config.get('gzh_claim_source', ''),
                 dry_run=dry_run,
             )
             if asyncio.iscoroutinefunction(publish_fn):
@@ -488,7 +496,8 @@ def execute_publish():
     # 平台名映射（与 /publish 一致，用于在 publish_details.platform 存可读名）
     platform_name_map = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: 'B站',
                          6: '百家号', 7: 'TikTok', 8: 'YouTube', 9: '腾讯视频', 10: '爱奇艺',
-                         11: '微博', 12: '支付宝', 13: '今日头条', 14: '知乎'}
+                         11: '微博', 12: '支付宝', 13: '今日头条', 14: '知乎', 15: 'CSDN',
+                         16: 'VIVO', 17: '微信公众号'}
     platform_label = platform_name_map.get(int(platform_type), str(platform_type))
 
     now = datetime.now().isoformat()

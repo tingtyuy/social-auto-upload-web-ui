@@ -8,6 +8,7 @@ Chromium) with automatic Playwright fallback.
 
 import asyncio
 import os
+import time
 from datetime import datetime
 
 from util._logger import bind_account_name, get_channel_logger
@@ -22,6 +23,7 @@ from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
     parse_schedule_time,
+    raise_if_page_closed,
     save_login_result,
     scrape_baijiahao_profile,
 )
@@ -34,6 +36,54 @@ class BaijiahaoPlatform(BasePlatform):
     platform_id = 6
     platform_key = "baijiahao"
     platform_name = "百家号"
+
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    # 百度系 cookie 全部由 passport.baidu.com 下发，通配 .baidu.com 后对
+    # baijiahao.baidu.com / passport.baidu.com / www.baidu.com 都生效。
+    platform_cookie_domain = ".baidu.com"
+
+    # Cookie 失效时可能跳到的所有百度账号体系登录/中间页子串。
+    # 任一命中即视为失效,不再依赖单一精确业务登录 URL。
+    _COOKIE_INVALID_URL_MARKERS = (
+        "/builder/theme/bjh/login",
+        "passport.baidu.com/v3/login",
+        "passport.baidu.com/v3/ucenter",
+        "wappass.baidu.com",
+        "auth.baidu.com",
+    )
+
+    def _parse_cookie_to_storage_state(
+        self, cookie_str: str
+    ) -> tuple[list[dict], list[dict]]:
+        """把 'k=v; k=v' 解析为 Playwright storage_state 的 (cookies, origins)。
+
+        - 全部 cookie 归属 ``platform_cookie_domain`` (.baidu.com)
+        - expires 给 7 天保守占位，sync_profile 跑完后 storage_state 会被
+          回写为真实的 cookie（含真实 expires + localStorage）
+        - localStorage 留空，由 sync_profile 自然补全
+        """
+        cookies: list[dict] = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": self.platform_cookie_domain,
+                "path": "/",
+                "expires": expires,
+                "httpOnly": True,
+                "secure": False,
+                "sameSite": "Lax",
+            })
+        logger.info(
+            f"[baijiahao] cookie 解析: {len(cookies)} 条, domain={self.platform_cookie_domain}"
+        )
+        return cookies, []
 
     # ------------------------------------------------------------------
     # login -- QR code / redirect via CloakBrowser
@@ -73,6 +123,9 @@ class BaijiahaoPlatform(BasePlatform):
                     status_queue=status_queue,
                     scrape_fn=scrape_baijiahao_profile,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(6 项运营数据),
+                    # 与 sync_profile 共用同一份抓取逻辑
+                    stats_fn=self._login_stats_fn,
                 )
                 success = True
             finally:
@@ -91,10 +144,15 @@ class BaijiahaoPlatform(BasePlatform):
         """Return True if the saved cookie file is still valid.
 
         Opens ``https://baijiahao.baidu.com/builder/rc/home`` with the
-        stored cookies.  If redirected to the login page, the cookie
-        is considered invalid.
+        stored cookies.  Cookie invalid if:
+        - cookie 文件不存在
+        - 跳到任意失效 URL marker (见 ``_COOKIE_INVALID_URL_MARKERS``)
+        - 跳出了 baijiahao.baidu.com 业务域 (兜底)
         """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        if not os.path.exists(cookie_path):
+            logger.info("[baijiahao] cookie file not found")
+            return False
         browser = await self.create_browser(headless=True)
         try:
             context = await self.create_context(
@@ -108,12 +166,27 @@ class BaijiahaoPlatform(BasePlatform):
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
                 await asyncio.sleep(2)
 
-                if "baijiahao.baidu.com/builder/theme/bjh/login" in page.url:
-                    logger.info("[baijiahao] cookie expired, needs re-login")
+                current_url = page.url or ""
+                # 黑名单: 任一失效 marker 命中即视为失效
+                for marker in self._COOKIE_INVALID_URL_MARKERS:
+                    if marker in current_url:
+                        logger.info(
+                            f"[baijiahao] cookie expired (matched: {marker})"
+                        )
+                        return False
+                # 业务域兜底: URL 必须在 baijiahao.baidu.com 下才算成功
+                if not current_url.startswith(
+                    "https://baijiahao.baidu.com/"
+                ):
+                    logger.info(
+                        f"[baijiahao] cookie redirected off-domain: {current_url}"
+                    )
                     return False
-                else:
-                    logger.info("[baijiahao] cookie valid")
-                    return True
+                logger.info("[baijiahao] cookie valid")
+                return True
+            except Exception as exc:
+                logger.info(f"[baijiahao] cookie check error: {exc}")
+                return False
             finally:
                 await context.close()
         finally:
@@ -123,11 +196,16 @@ class BaijiahaoPlatform(BasePlatform):
     # sync_profile -- refresh user name / avatar
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Baijiahao account settings page.
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """Sync profile info (name, avatar, stats) from Baijiahao.
 
-        Uses ``scrape_baijiahao_profile`` from ``_utils`` to scrape the
-        rendered account settings page.
+        抓取流程:
+        1. 访问 https://baijiahao.baidu.com/builder/rc/home 抓 name/avatar
+        2. 访问 https://baijiahao.baidu.com/ 抓 6 项 stats:
+           累计投稿量/累计阅读(播放)量/累计百度搜索量/总粉丝量/累计总收益/近30天分润收益
+        3. 同步完成后立即回写 storage_state,把本轮产生的 cookie + localStorage 一并落盘
+
+        卡片显示 3 项(粉丝量/累计阅读(播放)量/累计百度搜索量),其余 3 项进悬浮窗。
         """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         browser = await self.create_browser(headless=True)
@@ -141,11 +219,109 @@ class BaijiahaoPlatform(BasePlatform):
                     "https://baijiahao.baidu.com/builder/rc/home"
                 )
                 name, avatar = await scrape_baijiahao_profile(page)
-                return name, avatar
+
+                # 抓 stats(运营数据)
+                try:
+                    await page.goto("https://baijiahao.baidu.com/", wait_until="domcontentloaded", timeout=30000)
+                    stats = await self._scrape_baijiahao_stats(page)
+                except Exception as exc:
+                    logger.info(f"[baijiahao] 抓 stats 失败(不影响 name/avatar): {exc}")
+                    stats = []
+
+                # 同步完成后立即把 storage_state 写回(关键):
+                # 1) cookie 的真实 expires / httponly 等属性
+                # 2) 百家号域下产生的 localStorage (userinfo / token 等)
+                # 手工导入的 cookie 没有这些数据,不写回后续流程仍会失败。
+                try:
+                    await context.storage_state(path=cookie_path)
+                    logger.info(
+                        f"[baijiahao] sync_profile 已回写 storage_state: {cookie_path}"
+                    )
+                except Exception as e:
+                    logger.info(f"[baijiahao] 回写 storage_state 失败: {e}")
+
+                return {"name": name, "avatar": avatar, "stats": stats}
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+    async def _scrape_baijiahao_stats(self, page) -> list:
+        """抓取百家号首页 6 项运营数据。
+
+        页面 DOM 结构(参见用户提供的 2026-07-20 抓取样本):
+            <div class="FeReactApp-...-filterItem">
+                <div class="FeReactApp-...-title">累计投稿量<span>...</span></div>
+                <div class="FeReactApp-...-numbers"><span>18</span></div>
+                ...
+            </div>
+        每块 .filterItem 都有 title(指标名)和 numbers(数值)。
+
+        Returns:
+            list[dict]: 按 SORT 排序的运营数据列表
+        """
+        stats = []
+        # label_map: 百家号页面上的中文指标名 -> (ICON, SORT, 标准化 NAME)
+        # SORT 1-3 是卡片显示的优先项(粉丝/播放量/搜索量);4-6 进悬浮窗
+        label_map = {
+            "总粉丝量":         ("user",  1, "粉丝"),
+            "累计阅读(播放)量": ("play",  2, "播放量"),
+            "累计百度搜索量":   ("play",  3, "搜索量"),
+            "累计投稿量":       ("edit",  4, "投稿量"),
+            "累计总收益":       ("coin",  5, "累计收益"),
+            "近30天分润收益":   ("coin",  6, "近30天分润"),
+        }
+
+        try:
+            try:
+                await page.wait_for_selector(".FeReactApp-_3a492ee4f8f1a936-filterItem", timeout=10000)
+            except Exception:
+                logger.info("[baijiahao stats] 等待 .filterItem 超时")
+
+            raw = await page.evaluate(
+                '''() => {
+                    const out = [];
+                    document.querySelectorAll('.FeReactApp-_3a492ee4f8f1a936-filterItem').forEach(item => {
+                        const titleEl = item.querySelector('.FeReactApp-_3a492ee4f8f1a936-title');
+                        const numEl = item.querySelector('.FeReactApp-_3a492ee4f8f1a936-numbers span');
+                        if (!titleEl || !numEl) return;
+                        // title 文本去掉内嵌的 svg/icon 节点,只保留文字
+                        const label = (titleEl.textContent || '').trim();
+                        const num = (numEl.textContent || '').trim();
+                        if (label && num) out.push({label, num});
+                    });
+                    return out;
+                }'''
+            )
+            for item in raw:
+                label = item.get('label', '')
+                if label in label_map:
+                    icon, sort_no, name = label_map[label]
+                    try:
+                        count = int(str(item.get('num', '0')).replace(',', '').replace(' ', '').replace('+', '') or '0')
+                    except (ValueError, TypeError):
+                        count = 0
+                    stats.append({"ICON": icon, "COUNT": count, "NAME": name, "SORT": sort_no})
+        except Exception as exc:
+            logger.info(f"[baijiahao stats] 抓取失败: {exc}")
+
+        stats.sort(key=lambda x: x.get("SORT", 999))
+        return stats
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用 _scrape_baijiahao_stats 抓取逻辑。
+        """
+        try:
+            try:
+                await page.goto("https://baijiahao.baidu.com/", wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            return await self._scrape_baijiahao_stats(page)
+        except Exception as exc:
+            logger.info(f"[baijiahao login] _login_stats_fn 抓取失败: {exc}")
+            return []
 
     # ------------------------------------------------------------------
     # open_creator_center -- visible browser window (sync CloakBrowser)
@@ -236,6 +412,8 @@ class BaijiahaoPlatform(BasePlatform):
         start_days = kwargs.get("start_days", 0)
         thumbnail_landscape_path = kwargs.get("thumbnail_landscape_path")
         thumbnail_portrait_path = kwargs.get("thumbnail_portrait_path")
+        # 16:9 横版封面:第一个 cover-container 固定上传 16:9
+        thumbnail_landscape_169_path = kwargs.get("thumbnail_landscape_169_path", "") or ""
         desc = kwargs.get("desc", "")
         schedule_time_str = kwargs.get("schedule_time_str", "")
         creation_declaration = kwargs.get("creation_declaration", "")
@@ -251,6 +429,7 @@ class BaijiahaoPlatform(BasePlatform):
         logger.info("[发布参数] 定时发布: %s", enableTimer)
         logger.info("[发布参数] 横版封面: %s", thumbnail_landscape_path or "无")
         logger.info("[发布参数] 竖版封面: %s", thumbnail_portrait_path or "无")
+        logger.info("[发布参数] 横版16:9封面: %s", thumbnail_landscape_169_path or "无")
         logger.info("[发布参数] 创作声明: %s", creation_declaration or "无")
         logger.info("[发布参数] 补充声明: %s", supplementary_declaration or "无")
         logger.info("[发布策略] 发布策略: %s", "scheduled" if enableTimer and schedule_time_str else "immediate")
@@ -294,6 +473,7 @@ class BaijiahaoPlatform(BasePlatform):
                         account_file=cookie_path,
                         thumbnail_landscape_path=thumbnail_landscape_path,
                         thumbnail_portrait_path=thumbnail_portrait_path,
+                        thumbnail_landscape_169_path=thumbnail_landscape_169_path,
                         desc=desc,
                         creation_declaration=creation_declaration,
                         supplementary_declaration=supplementary_declaration,
@@ -317,6 +497,7 @@ class BaijiahaoPlatform(BasePlatform):
         account_file: str,
         thumbnail_landscape_path=None,
         thumbnail_portrait_path=None,
+        thumbnail_landscape_169_path="",
         desc="",
         creation_declaration="",
         supplementary_declaration="",
@@ -374,6 +555,7 @@ class BaijiahaoPlatform(BasePlatform):
 
                 # Wait for the form page to appear
                 while True:
+                    raise_if_page_closed(page)
                     try:
                         await page.wait_for_selector(
                             "div#formMain:visible"
@@ -419,11 +601,20 @@ class BaijiahaoPlatform(BasePlatform):
                         await asyncio.sleep(3)
 
                 # Set custom covers
+                # 百家号封面对应关系固定, 不按视频方向:
+                #   第一个 cover-container  → 横屏 16:9 封面
+                #   第二个 cover-container  → 竖屏 3:4  封面
+                picked_landscape = thumbnail_landscape_169_path or thumbnail_landscape_path
+                picked_portrait = thumbnail_portrait_path
+                logger.info(
+                    "[设置封面] 横版16:9封面=%s, 竖版3:4封面=%s",
+                    picked_landscape or "无", picked_portrait or "无",
+                )
                 logger.info("[设置封面] 开始设置视频封面...")
                 await self._set_cover(
                     page,
-                    thumbnail_landscape_path,
-                    thumbnail_portrait_path,
+                    picked_landscape,
+                    picked_portrait,
                 )
                 logger.info("[设置封面] 封面设置完成")
 
@@ -483,7 +674,7 @@ class BaijiahaoPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: 前置校验 - 描述+标签总字符 ≤50(emoji 按 3 算),最多 10 标签
@@ -565,7 +756,8 @@ class BaijiahaoPlatform(BasePlatform):
         to trigger the topic search dropdown, then the first suggestion is
         selected.
         """
-        desc_text = (desc or title or "").strip()[:2000]
+        # 描述为空时不再回落标题，保持为空
+        desc_text = (desc or "").strip()[:2000]
 
         # Lexical contenteditable editor
         lexical_editor = page.locator('[data-lexical-editor="true"]')

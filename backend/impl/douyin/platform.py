@@ -6,9 +6,12 @@ All browser operations go through ``BasePlatform.create_browser()`` /
 Chromium) with automatic Playwright fallback.
 """
 
+from __future__ import annotations
+
 import asyncio
 import re
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -21,12 +24,32 @@ from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
     parse_schedule_time,
+    raise_if_page_closed,
     save_login_result,
     scrape_user_profile,
 )
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("douyin")
+
+
+def _parse_count_text(num_str: str) -> int:
+    """解析平台数字文本: '120' -> 120, '1.2万' -> 12000, '3亿' -> 300000000。
+
+    大号数据平台会缩写为"万/亿"后缀，直接 int() 会失败归零。
+    """
+    s = str(num_str or '').replace(',', '').replace(' ', '').strip()
+    if not s:
+        return 0
+    mult = 1
+    if s.endswith('亿'):
+        mult, s = 100000000, s[:-1]
+    elif s.endswith('万'):
+        mult, s = 10000, s[:-1]
+    try:
+        return int(float(s) * mult)
+    except (ValueError, TypeError):
+        return 0
 
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
@@ -41,18 +64,54 @@ class DouyinPlatform(BasePlatform):
     platform_key = "douyin"
     platform_name = "抖音"
 
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    # 抖音 cookie 全部由 .douyin.com 域下发，覆盖 creator.douyin.com 子域
+    platform_cookie_domain = ".douyin.com"
+
+    def _parse_cookie_to_storage_state(
+        self, cookie_str: str
+    ) -> tuple[list[dict], list[dict]]:
+        """把 'k=v; k=v' 解析为 Playwright storage_state 的 (cookies, origins)。
+
+        - 全部 cookie 归属 ``platform_cookie_domain`` (.douyin.com)
+        - expires 给 7 天保守占位，sync_profile 跑完后 storage_state 会被
+          回写为真实的 cookie（含真实 expires + localStorage）
+        - localStorage 留空，由 sync_profile 自然补全
+        """
+        cookies: list[dict] = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": self.platform_cookie_domain,
+                "path": "/",
+                "expires": expires,
+                "httpOnly": True,
+                "secure": False,
+                "sameSite": "Lax",
+            })
+        logger.info(
+            f"[douyin] cookie 解析: {len(cookies)} 条, domain={self.platform_cookie_domain}"
+        )
+        return cookies, []
+
     # ------------------------------------------------------------------
     # login — QR code scan via CloakBrowser
     # ------------------------------------------------------------------
 
     async def login(self, id: str, status_queue: Queue, account_id=None) -> None:
-        """Perform Douyin login via QR code scan.
+        """Perform Douyin login.
 
-        Opens ``https://creator.douyin.com/``, extracts the QR image from
-        ``get_by_role("img", name="二维码")``, sends the image URL to
-        *status_queue*, then waits for the page to navigate away (indicating
-        the user scanned the code).  On success, scrapes the user profile and
-        saves the login result.
+        直接打开 ``https://creator.douyin.com/``，由用户在浏览器里扫码完成
+        登录。后端通过监听主框架 URL 变化判断登录成功（不设超时，浏览器由
+        用户自己关），随后抓取用户资料并落库。不再提取/推送二维码——前端
+        只等 ``status:200``。
         """
         url_changed_event = asyncio.Event()
 
@@ -68,12 +127,6 @@ class DouyinPlatform(BasePlatform):
                 page = await context.new_page()
                 await page.goto("https://creator.douyin.com/")
                 original_url = page.url
-
-                # Extract QR code image
-                img_locator = page.get_by_role("img", name="二维码")
-                src = await img_locator.get_attribute("src")
-                logger.info("QR image src: %s", src)
-                status_queue.put(src)
 
                 # Monitor URL change via framenavigated
                 page.on(
@@ -96,6 +149,9 @@ class DouyinPlatform(BasePlatform):
                     status_queue=status_queue,
                     scrape_fn=scrape_user_profile,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(关注/粉丝/获赞),
+                    # 与 sync_profile 共用同一份抓取逻辑
+                    stats_fn=self._login_stats_fn,
                 )
                 success = True
             finally:
@@ -152,8 +208,14 @@ class DouyinPlatform(BasePlatform):
     # sync_profile — refresh user name / avatar
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Douyin creator centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """同步抖音昵称、头像、运营数据(stats)。
+
+        创作中心首页 (creator.douyin.com/) 同一个容器里有
+        头像 / 昵称 / 3 项 stats(关注/粉丝/获赞)。
+        抖音 CSS-in-JS class 名带 hash 后缀,易变,
+        用 .statics-item-MDWoNA 容器 + 文本节点(关注/粉丝/获赞)定位。
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         browser = await self.create_browser(headless=True)
         try:
@@ -163,43 +225,140 @@ class DouyinPlatform(BasePlatform):
                 try:
                     await page.goto(
                         "https://creator.douyin.com/",
-                        wait_until="networkidle",
+                        wait_until="domcontentloaded",
                         timeout=30000,
                     )
                 except Exception:
-                    # networkidle can timeout; page content may still be usable
                     pass
+                # 等用户卡片渲染(短超时)
+                try:
+                    await page.wait_for_selector(
+                        "[class*='statics-'], [class*='statics-item-']",
+                        timeout=8000,
+                    )
+                except Exception:
+                    logger.info("[douyin stats] 等待 statics 超时")
+
                 name, avatar = await scrape_user_profile(page)
-                return name, avatar
+
+                # 抓 3 项 stats(关注/粉丝/获赞),用文本节点匹配而非 id/class hash
+                result = await page.evaluate(
+                    '''() => {
+                        const out = [];
+                        document.querySelectorAll('[class*="statics-item-"]').forEach(item => {
+                            // 数字 span 文本为纯数字(可含千分位/万/亿),箭头图标 span 文本为空会被跳过
+                            const numEl = Array.from(item.querySelectorAll('span')).find(s => {
+                                const t = (s.textContent || '').trim();
+                                return t && /^[\\d,.\\s]+[万亿]?$/.test(t);
+                            });
+                            if (!numEl) return;
+                            const num = (numEl.textContent || '').trim();
+                            // textContent 是 label + 数字拼接,识别 label
+                            const full = (item.textContent || '').trim();
+                            let label = '';
+                            if (full.startsWith('关注')) label = '关注';
+                            else if (full.startsWith('粉丝')) label = '粉丝';
+                            else if (full.startsWith('获赞')) label = '获赞';
+                            if (label && num) {
+                                out.push({label, num});
+                            }
+                        });
+                        return out;
+                    }'''
+                )
+
+                label_map = {
+                    "关注": ("follow", 1, "关注"),
+                    "粉丝": ("user",   2, "粉丝"),
+                    "获赞": ("like",   3, "获赞"),
+                }
+                stats = []
+                for item in (result or []):
+                    lbl = item.get('label', '')
+                    num_str = str(item.get('num', '0'))
+                    if lbl in label_map:
+                        icon, sort_no, std_name = label_map[lbl]
+                        count = _parse_count_text(num_str)
+                        stats.append({"ICON": icon, "COUNT": count, "NAME": std_name, "SORT": sort_no})
+
+                if not name and not avatar and not stats:
+                    logger.info(f"[douyin] sync_profile 抓取为空,url={page.url}")
+
+                return {"name": name, "avatar": avatar, "stats": stats}
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用同一份 evaluate 抓取逻辑。
+        """
+        try:
+            await page.wait_for_selector(
+                "[class*='statics-item-']",
+                timeout=8000,
+            )
+        except Exception:
+            logger.info("[douyin login] 等待 statics 超时")
+
+        result = await page.evaluate(
+            '''() => {
+                const out = [];
+                document.querySelectorAll('[class*="statics-item-"]').forEach(item => {
+                    // 数字 span 文本为纯数字(可含千分位/万/亿),箭头图标 span 文本为空会被跳过
+                    const numEl = Array.from(item.querySelectorAll('span')).find(s => {
+                        const t = (s.textContent || '').trim();
+                        return t && /^[\\d,.\\s]+[万亿]?$/.test(t);
+                    });
+                    if (!numEl) return;
+                    const num = (numEl.textContent || '').trim();
+                    const full = (item.textContent || '').trim();
+                    let label = '';
+                    if (full.startsWith('关注')) label = '关注';
+                    else if (full.startsWith('粉丝')) label = '粉丝';
+                    else if (full.startsWith('获赞')) label = '获赞';
+                    if (label && num) out.push({label, num});
+                });
+                return out;
+            }'''
+        )
+
+        label_map = {
+            "关注": ("follow", 1, "关注"),
+            "粉丝": ("user",   2, "粉丝"),
+            "获赞": ("like",   3, "获赞"),
+        }
+        stats = []
+        for item in (result or []):
+            lbl = item.get('label', '')
+            num_str = str(item.get('num', '0'))
+            if lbl in label_map:
+                icon, sort_no, std_name = label_map[lbl]
+                count = _parse_count_text(num_str)
+                stats.append({"ICON": icon, "COUNT": count, "NAME": std_name, "SORT": sort_no})
+        return stats
 
     # ------------------------------------------------------------------
     # open_creator_center — visible browser window (sync CloakBrowser)
     # ------------------------------------------------------------------
 
     async def open_creator_center(self, cookie_file: str) -> None:
-        """Open the Douyin creator centre in a visible browser window."""
+        """Open the Douyin creator centre in a visible browser window.
+
+        打开后立即返回，不做任何等待或关闭 —— 浏览器由用户自己关。
+        线程仅负责启动浏览器，启动完就结束（browser 对象保留在闭包里，
+        CloakBrowser 子进程会随主进程存活）。
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         url = "https://creator.douyin.com/"
 
         def _launch():
             browser = create_browser_sync(headless=False)
-            try:
-                context = create_context_sync(browser, storage_state=cookie_path)
-                page = context.new_page()
-                page.goto(url)
-                try:
-                    page.wait_for_event("close", timeout=0)
-                except Exception:
-                    pass
-            finally:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+            context = create_context_sync(browser, storage_state=cookie_path)
+            page = context.new_page()
+            page.goto(url)
 
         thread = threading.Thread(target=_launch, daemon=True)
         thread.start()
@@ -401,6 +560,7 @@ class DouyinPlatform(BasePlatform):
 
                 # Wait for redirect to publish page (version 1 or version 2)
                 while True:
+                    raise_if_page_closed(page)
                     try:
                         await page.wait_for_url(
                             "https://creator.douyin.com/creator-micro/content/publish?enter_from=publish_page",
@@ -422,18 +582,20 @@ class DouyinPlatform(BasePlatform):
                 # Append activities as hashtags to description (与图文发布一致)
                 if activities:
                     activity_tags = " ".join([f"#{act}" for act in activities])
-                    desc = f"{desc or title} {activity_tags}".strip()
+                    desc = f"{desc} {activity_tags}".strip()
 
                 # Fill title, description, tags
+                # 描述为空时不再回落标题：描述就保持为空
                 logger.info("[填写标题] 开始填写标题与简介...")
                 await self._fill_title_and_description(
-                    page, title, desc or title, tags
+                    page, title, desc, tags
                 )
                 logger.info("[填写标题] 标题与简介填写完成")
                 logger.info("[填写标题] 标题: %s", title)
 
                 # Wait for upload to complete
                 while True:
+                    raise_if_page_closed(page)
                     try:
                         number = await page.locator(
                             '[class^="long-card"] div:has-text("重新上传")'
@@ -539,6 +701,7 @@ class DouyinPlatform(BasePlatform):
                 # Click publish and wait for redirect
                 logger.info("[发布] 正在点击发布按钮...")
                 while True:
+                    raise_if_page_closed(page)
                     try:
                         publish_button = page.get_by_role(
                             "button", name="发布", exact=True
@@ -562,7 +725,7 @@ class DouyinPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: 前置校验 - 话题总数 ≤ 5(描述 #xxx + 标签 + 官方活动)
@@ -652,17 +815,100 @@ class DouyinPlatform(BasePlatform):
 
     @staticmethod
     async def _set_schedule_time(page, publish_date):
-        label_element = page.locator("[class^='radio']:has-text('定时发布')")
-        await label_element.click()
-        await asyncio.sleep(1)
+        # 抖音使用字节 Semi Design 的 dateTime 选择器：日期与时间分属两个视图，
+        # 由 .semi-datepicker-switch 切换；dateTime 模式需手动确认(needConfirm)。
+        # 仅往输入框敲文本+回车只能可靠设置日期，时间(HH:MM)会被丢弃，
+        # 因此必须切到时间滚轮(.semi-datepicker-switch-time)分别选时/分。
+        if isinstance(publish_date, int) and publish_date == 0:
+            return
 
-        publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
-        await asyncio.sleep(1)
-        await page.locator('.semi-input[placeholder="日期和时间"]').click()
-        # 清空后输入(跨平台:Mac 用 Cmd+A,其他用 Ctrl+A)
-        await clear_and_type(page, str(publish_date_hour))
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
+        dt = publish_date
+        expected = dt.strftime("%Y-%m-%d %H:%M")
+        logger.info("[定时发布] 开始设置定时发布时间: %s", expected)
+        try:
+            # 1. 选择「定时发布」单选项
+            await page.locator("[class^='radio']:has-text('定时发布')").click()
+            await asyncio.sleep(1)
+
+            # 2. 打开日期时间选择面板
+            await page.locator('.semi-input[placeholder="日期和时间"]').click()
+            await asyncio.sleep(1)
+
+            # 3. 选择日期：点击对应日期格(title=YYYY-MM-DD，排除禁用日期)
+            iso_date = dt.strftime("%Y-%m-%d")
+            day_cell = page.locator(
+                f'.semi-datepicker-day:not(.semi-datepicker-day-disabled)[title="{iso_date}"]'
+            )
+            if await day_cell.count():
+                await day_cell.first.click()
+                logger.info("[定时发布] 日期已选择: %s", iso_date)
+            else:
+                logger.warning("[定时发布] 未找到可选日期 %s，跳过日期选择", iso_date)
+            await asyncio.sleep(0.5)
+
+            # 4. 切换到时间选择滚轮
+            switch_time = page.locator('.semi-datepicker-switch-time')
+            if await switch_time.count():
+                await switch_time.first.click()
+                logger.info("[定时发布] 已切换到时间选择滚轮")
+                await asyncio.sleep(1)
+            else:
+                logger.warning("[定时发布] 未找到时间切换开关 .semi-datepicker-switch-time")
+
+            # 5. 选择小时(滚轮内 li 文本为纯数字；选中项带「时」后缀，has_text 均可命中)
+            hour = dt.strftime("%H")
+            hour_item = (
+                page.locator('.semi-scrolllist-item-wheel.undefined-list-hour li')
+                .filter(has_text=hour)
+            )
+            if await hour_item.count():
+                await hour_item.first.click()
+                logger.info("[定时发布] 小时已选择: %s", hour)
+            else:
+                logger.warning("[定时发布] 未找到小时项 %s", hour)
+            await asyncio.sleep(0.4)
+
+            # 6. 选择分钟
+            minute = dt.strftime("%M")
+            minute_item = (
+                page.locator('.semi-scrolllist-item-wheel.undefined-list-minute li')
+                .filter(has_text=minute)
+            )
+            if await minute_item.count():
+                await minute_item.first.click()
+                logger.info("[定时发布] 分钟已选择: %s", minute)
+            else:
+                logger.warning("[定时发布] 未找到分钟项 %s", minute)
+            await asyncio.sleep(0.4)
+
+            # 7. 确认(dateTime 模式需点「确定」；找不到则回车兜底)
+            confirmed = False
+            confirm_btn = page.locator('.semi-popover button:has-text("确定")')
+            if await confirm_btn.count():
+                await confirm_btn.first.click()
+                confirmed = True
+                logger.info("[定时发布] 已点击「确定」确认")
+            if not confirmed:
+                await page.keyboard.press("Enter")
+                logger.info("[定时发布] 未找到确认按钮，已按 Enter 兜底")
+            await asyncio.sleep(1)
+
+            # 8. 校验输入框最终值，便于排查时间是否真的生效
+            try:
+                final_val = await page.input_value(
+                    '.semi-input[placeholder="日期和时间"]'
+                )
+                if final_val and dt.strftime("%H:%M") in final_val:
+                    logger.info("[定时发布] 校验成功，输入框值: %s", final_val)
+                else:
+                    logger.warning(
+                        "[定时发布] 校验异常，输入框值: %s（期望含 %s）",
+                        final_val, dt.strftime("%H:%M"),
+                    )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error("[定时发布] 设置定时发布时间失败: %s", exc)
 
     # ------------------------------------------------------------------
     # Helper: set product link (购物车)
@@ -1145,7 +1391,7 @@ class DouyinPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: set image cover

@@ -19,8 +19,14 @@ import logoWeibo from '@/assets/logos/weibo.png'
 import logoAlipay from '@/assets/logos/alipay.png'
 import logoToutiao from '@/assets/logos/toutiao.png'
 import logoZhihu from '@/assets/logos/zhihu.png'
+import logoCsdn from '@/assets/logos/csdn.png'
+import logoVivo from '@/assets/logos/vivo.svg'
+import logoWeixinGzh from '@/assets/logos/weixin_gzh.png'
+import logoTaobaoGuanghe from '@/assets/logos/taobao_guanghe.png'
+import logoJingmai from '@/assets/logos/jingmai.png'
 
 import { WEIBO_CATEGORIES } from './weibo-categories'
+import { CHANNELS_MARK_TAGS, CHANNELS_SHOOT_REGIONS } from './channels-mark-tags'
 
 /**
  * 特殊作者声明值：表示「无需添加声明」。
@@ -73,11 +79,27 @@ export const PLATFORMS = {
     cssClass: 'channels',
     creatorUrl: 'https://channels.weixin.qq.com/',
     settingsFields: [
+      // 视频标注:发布页「选择视频标注」下拉,所有选项(含「无需标注」)都会去页面真正选中。
+      { key: 'channelsMarkTag', label: '视频标注', type: 'select', placeholder: '选择视频标注',
+        options: CHANNELS_MARK_TAGS.map(t => ({ label: t.tagName, value: t.tagName })) },
+      // 自行拍摄联动字段:拍摄时间 + 拍摄地点(国家/省/市级联)
+      { key: 'channelsShootDate', label: '拍摄时间', type: 'date', placeholder: '选择拍摄日期',
+        visibleWhen: { key: 'channelsMarkTag', value: '内容为自行拍摄' } },
+      { key: 'channelsShootRegion', label: '拍摄地点', type: 'cascader',
+        placeholder: '选择国家 / 省 / 市', options: CHANNELS_SHOOT_REGIONS,
+        // click 触发: 240 国长列表用 hover 易误触, click 更稳;
+        // 不用 checkStrictly(它会让点文字变成"选中并关闭"而非展开下一级,
+        // 导致中国→省 的二级面板永远展不开)。
+        props: { expandTrigger: 'click' },
+        visibleWhen: { key: 'channelsMarkTag', value: '内容为自行拍摄' } },
+      // 转载联动字段:转载来源(选填)
+      { key: 'channelsRepostSource', label: '转载来源', type: 'input', placeholder: '请输入转载来源（选填）',
+        visibleWhen: { key: 'channelsMarkTag', value: '内容为转载' } },
       { key: 'isOriginal', label: '原创声明', type: 'radio', options: [{ label: '原创', value: true }, { label: '非原创', value: false }] },
       { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
       { key: 'videoFormat', label: '视频格式', type: 'radio', options: [{ label: '横版', value: 'landscape' }, { label: '竖版', value: 'portrait' }] },
     ],
-    defaultSettings: { title: '', description: '', isOriginal: false, scheduleTime: '', videoFormat: '' },
+    defaultSettings: { title: '', description: '', channelsMarkTag: '无需标注', channelsShootDate: '', channelsShootRegion: [], channelsRepostSource: '', channelsActivityName: '', channelsActivityData: null, isOriginal: false, scheduleTime: '', videoFormat: '' },
   },
   DOUYIN: {
     id: 3,
@@ -175,11 +197,13 @@ export const PLATFORMS = {
         { label: '个人观点，仅供参考', value: '个人观点，仅供参考' },
         { label: '内容为转载', value: '内容为转载' },
       ] },
+      // 转载联动字段:创作声明选「内容为转载」时显示,B 站要求转载必填来源
+      { key: 'biliRepostSource', label: '转载来源', type: 'input', required: true, placeholder: '请输入转载来源(例:转自 https://xxx)', visibleWhen: { key: 'creationDeclaration', value: '内容为转载' } },
       { key: 'isOriginal', label: '原创声明', type: 'radio', options: [{ label: '原创', value: true }, { label: '非原创', value: false }] },
       { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
       { key: 'videoFormat', label: '视频格式', type: 'radio', options: [{ label: '横版', value: 'landscape' }, { label: '竖版', value: 'portrait' }] },
     ],
-    defaultSettings: { title: '', description: '', zone: '', creationDeclaration: '', isOriginal: false, scheduleTime: '', videoFormat: '' },
+    defaultSettings: { title: '', description: '', zone: '', creationDeclaration: '', biliRepostSource: '', isOriginal: false, scheduleTime: '', videoFormat: '' },
   },
   BAIJIAHAO: {
     id: 6,
@@ -373,8 +397,26 @@ export const PLATFORMS = {
           { label: '内容由AI生成', value: '内容由AI生成' },
           { label: '内容为虚构演绎', value: '内容为虚构演绎' },
         ] },
+      { key: 'contentStatement2', label: '内容声明2', type: 'select',
+        placeholder: '请选择内容声明2（必选）',
+        options: [
+          { label: '内容无需标注', value: '内容无需标注' },
+          { label: '内容为转载', value: '内容为转载' },
+          { label: '含AI生成内容', value: '含AI生成内容' },
+          { label: '含虚构演绎内容', value: '含虚构演绎内容' },
+          { label: '个人观点，仅供参考', value: '个人观点，仅供参考' },
+          { label: '内容含营销信息', value: '内容含营销信息' },
+        ] },
+      { key: 'contentStatement2Optional', label: '内容声明2(可选)', type: 'select',
+        placeholder: '选填，可不选',
+        options: [
+          { label: '内容可能引人不适，请谨慎观看', value: '内容可能引人不适，请谨慎观看' },
+          { label: '内容含有高危险行为，请勿模仿', value: '内容含有高危险行为，请勿模仿' },
+          { label: '请理性适度消费', value: '请理性适度消费' },
+          { label: '未成年人请在监护人指导下浏览', value: '未成年人请在监护人指导下浏览' },
+        ] },
     ],
-    defaultSettings: { title: '', description: '', videoType: '', weiboCategory: [], contentStatement: '' },
+    defaultSettings: { title: '', description: '', videoType: '', weiboCategory: [], contentStatement: '', contentStatement2: '', contentStatement2Optional: '' },
   },
   ALIPAY: {
     id: 12,
@@ -396,11 +438,13 @@ export const PLATFORMS = {
         { label: '内容含营销信息', value: '内容含营销信息' },
         { label: '内容为转载', value: '内容为转载' },
       ] },
+      // 转载来源联动字段:作者声明选「内容为转载」时显示,支付宝要求转载必填来源地址
+      { key: 'reprintUrl', label: '转载来源', type: 'input', required: true, placeholder: '请输入视频原地址(例:https://xxx)', visibleWhen: { key: 'authorStatement', value: '内容为转载' } },
       { key: 'compilation', label: '加入合集', type: 'compilationSelect', placeholder: '输入合集名称搜索' },
       { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
       { key: 'videoFormat', label: '视频格式', type: 'radio', options: [{ label: '横版', value: 'landscape' }, { label: '竖版', value: 'portrait' }] },
     ],
-    defaultSettings: { title: '', description: '', authorStatement: '', compilation: '', scheduleTime: '', videoFormat: '' },
+    defaultSettings: { title: '', description: '', authorStatement: '', reprintUrl: '', compilation: '', scheduleTime: '', videoFormat: '' },
   },
   TOUTIAO: {
     id: 13,
@@ -552,6 +596,150 @@ export const PLATFORMS = {
     ],
     defaultSettings: { title: '', description: '', creationDeclaration: '内容无需标注', category: '', scheduleTime: '', videoFormat: '' },
   },
+  CSDN: {
+    id: 15,
+    key: 'csdn',
+    name: 'CSDN',
+    shortName: 'CSDN',
+    letter: 'C',
+    logo: logoCsdn,
+    color: '#FC5531',
+    bgColor: 'rgba(252, 85, 49, 0.15)',
+    cssClass: 'csdn',
+    creatorUrl: 'https://mp.csdn.net/',
+    settingsFields: [
+      { key: 'recommend', label: '是否推荐', type: 'switch', description: '勾选后发布的视频将被推荐' },
+    ],
+    defaultSettings: { title: '', description: '', recommend: false, scheduleTime: '' },
+  },
+  VIVO: {
+    id: 16,
+    key: 'vivo',
+    name: 'VIVO',
+    shortName: 'VIVO',
+    letter: 'V',
+    logo: logoVivo,
+    color: '#4154FF',
+    bgColor: 'rgba(65, 84, 255, 0.15)',
+    cssClass: 'vivo',
+    creatorUrl: 'https://www.kaixinkan.com.cn/#/home',
+    settingsFields: [
+      // 位置(平台级):浏览器自动化打开 vivo 发布页搜索回传下拉数据,空=不显示位置
+      { key: 'vivoLocationName', label: '添加位置', type: 'poiSelect', placeholder: '输入地理位置' },
+      // 作品同步(平台级开关):勾选后同时分发到 vivo 浏览器、i 视频、阅图
+      { key: 'vivoDistribution', label: '作品同步', type: 'switch',
+        description: '同时分发到vivo浏览器、i视频、阅图，获取更多流量' },
+      // 自主声明(平台级下拉)
+      { key: 'vivoDeclaration', label: '自主声明', type: 'select', placeholder: '请选择', options: [
+        { label: '含AI生成内容', value: '含AI生成内容' },
+        { label: '含虚构演绎内容', value: '含虚构演绎内容' },
+        { label: '内容含营销信息', value: '内容含营销信息' },
+        { label: '内容为转载', value: '内容为转载' },
+        { label: '个人观点，仅供参考', value: '个人观点，仅供参考' },
+        { label: '内容无需标注', value: '内容无需标注' },
+      ] },
+      // 谁可以看 / 下载权限(默认与平台一致:公开 + 允许下载)
+      { key: 'vivoPrivacy', label: '谁可以看', type: 'radio',
+        options: [{ label: '公开', value: '公开' }, { label: '私密', value: '私密' }] },
+      { key: 'vivoDownloadPermission', label: '下载权限', type: 'radio',
+        options: [{ label: '允许', value: '允许' }, { label: '不允许', value: '不允许' }] },
+      { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
+    ],
+    defaultSettings: { title: '', description: '', vivoLocationName: '', vivoLocationData: null,
+      vivoDistribution: false, vivoDeclaration: '', vivoPrivacy: '公开',
+      vivoDownloadPermission: '允许', scheduleTime: '', tags: [] },
+  },
+  WEIXIN_GZH: {
+    id: 17,
+    key: 'weixin_gzh',
+    name: '微信公众号',
+    shortName: '公众号',
+    letter: '微',
+    logo: logoWeixinGzh,
+    color: '#07C160',
+    bgColor: 'rgba(7, 193, 96, 0.15)',
+    cssClass: 'weixin_gzh',
+    creatorUrl: 'https://mp.weixin.qq.com/',
+    settingsFields: [
+      { key: 'isOriginal', label: '原创声明', type: 'radio', options: [{ label: '原创', value: true }, { label: '非原创', value: false }] },
+      { key: 'gzhClaimSource', label: '创作来源', type: 'select',
+        placeholder: '请选择创作来源（可选）',
+        options: [
+          { label: '内容由AI生成', value: '内容由AI生成' },
+          { label: '内容剧情演绎，仅供娱乐', value: '内容剧情演绎，仅供娱乐' },
+          { label: '个人观点，仅供参考', value: '个人观点，仅供参考' },
+          { label: '健康医疗分享，仅供参考', value: '健康医疗分享，仅供参考' },
+          { label: '投资观点，仅供参考', value: '投资观点，仅供参考' },
+          { label: '无需声明', value: '无需声明' },
+        ] },
+      { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间（最近7天，需大于当前1小时）' },
+    ],
+    defaultSettings: { title: '', description: '', isOriginal: false, gzhClaimSource: '', gzhCollectionName: '', gzhCollectionData: null, scheduleTime: '', videoFormat: '' },
+  },
+  TAOBAO_GUANGHE: {
+    id: 18,
+    key: 'taobao_guanghe',
+    name: '淘宝光合',
+    shortName: '光合',
+    letter: '淘',
+    logo: logoTaobaoGuanghe,
+    color: '#FF5000',
+    bgColor: 'rgba(255, 80, 0, 0.15)',
+    cssClass: 'taobao_guanghe',
+    creatorUrl: 'https://creator.guanghe.taobao.com/',
+    settingsFields: [
+      // 创作者声明(平台必填,后端未传时默认「内容无需标注」)
+      { key: 'guangheClaim', label: '创作者声明', type: 'select', required: true,
+        placeholder: '请选择创作者声明',
+        options: [
+          { label: '内容无需标注', value: '内容无需标注' },
+          { label: '含AI生成内容', value: '含AI生成内容' },
+          { label: '含虚构演绎内容', value: '含虚构演绎内容' },
+          { label: '内容为转载', value: '内容为转载' },
+          { label: '个人观点，仅供参考', value: '个人观点，仅供参考' },
+          { label: '内容含营销信息', value: '内容含营销信息' },
+        ] },
+      { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
+    ],
+    defaultSettings: { title: '', description: '', guangheClaim: '', guangheLinkType: '', guangheProducts: [], guangheShops: [], scheduleTime: '' },
+  },
+  JINGMAI: {
+    id: 19,
+    key: 'jingmai',
+    name: '京东京麦',
+    shortName: '京麦',
+    letter: '京',
+    logo: logoJingmai,
+    color: '#E1251B',
+    bgColor: 'rgba(225, 37, 27, 0.15)',
+    cssClass: 'jingmai',
+    creatorUrl: 'https://dr.jd.com/jm/',
+    hideFields: ['description', 'tags'],
+    // 创作声明 + 定时发布都走 settingsFields 通用渲染,与其他平台布局一致
+    settingsFields: [
+      { key: 'jdDeclaration', label: '创作声明', type: 'select',
+        placeholder: '请选择创作声明',
+        options: [
+          { label: '含AI生成内容', value: '含AI生成内容' },
+          { label: '含虚构演绎内容', value: '含虚构演绎内容' },
+          { label: '内容为转载', value: '内容为转载' },
+          { label: '个人观点,仅供参考', value: '个人观点,仅供参考' },
+          { label: '内容含营销广告', value: '内容含营销广告' },
+          { label: '内容无需标注', value: '内容无需标注' },
+        ] },
+      { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
+    ],
+    defaultSettings: {
+      title: '',
+      description: '',
+      jdRelatedType: '',
+      jdProducts: [],
+      jdNovel: '',
+      jdDeclaration: '',
+      scheduleTime: '',
+    },
+  },
+  // 注: jd (id=20) 已合并到 jingmai (id=19) — 同一个产品 dr.jd.com/jm/
 }
 
 // 派生数据

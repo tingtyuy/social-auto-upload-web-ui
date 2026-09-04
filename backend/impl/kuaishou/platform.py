@@ -5,8 +5,11 @@ Uses ``BasePlatform`` browser entry points and shared utilities from
 ``backend/impl/_utils.py``.
 """
 
+from __future__ import annotations
+
 import asyncio
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -20,6 +23,7 @@ from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
     parse_schedule_time,
+    raise_if_page_closed,
     save_login_result,
     scrape_user_profile,
 )
@@ -48,6 +52,24 @@ class KuaishouPlatform(BasePlatform):
     platform_id = 4
     platform_key = "kuaishou"
     platform_name = "快手"
+
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    platform_cookie_domain = ".kuaishou.com"
+
+    def _parse_cookie_to_storage_state(self, cookie_str):
+        cookies = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair: continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(), "value": value.strip(),
+                "domain": self.platform_cookie_domain, "path": "/",
+                "expires": expires, "httpOnly": True, "secure": False, "sameSite": "Lax",
+            })
+        return cookies, []
 
     # ------------------------------------------------------------------
     # Login — QR code scan via CloakBrowser
@@ -124,6 +146,9 @@ class KuaishouPlatform(BasePlatform):
                 status_queue=status_queue,
                 scrape_fn=scrape_user_profile,
                 account_id=account_id,
+                # 登录成功后在同一个 session 内补抓 stats(粉丝/关注/获赞),
+                # 与 sync_profile 共用同一份抓取逻辑
+                stats_fn=self._login_stats_fn,
             )
             success = True
         except Exception as exc:
@@ -187,28 +212,138 @@ class KuaishouPlatform(BasePlatform):
     # Sync profile
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Kuaishou creator centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """Sync profile info (name, avatar, stats) from Kuaishou creator centre.
+
+        抓取流程:
+        1. 访问 cp.kuaishou.com/profile
+        2. 点击右上角用户头像触发 popover
+        3. 在 popover 中读取 user-cnt__item(粉丝/关注/获赞)
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         browser = await self.create_browser(headless=True)
         try:
             context = await self.create_context(browser, storage_state=cookie_path)
             page = await context.new_page()
-            await page.goto(_KS_UPLOAD_URL, timeout=15000)
-            await page.wait_for_load_state("domcontentloaded")
-            return await scrape_user_profile(page)
-        except Exception as exc:
-            logger.info(f"[kuaishou] sync_profile error: {exc}")
-            return ("", "")
-        finally:
             try:
+                await page.goto(_KS_UPLOAD_URL, timeout=15000)
+                await page.wait_for_load_state("domcontentloaded")
+                name, avatar = await scrape_user_profile(page)
+                stats = await self._scrape_kuaishou_stats(page)
+                return {"name": name, "avatar": avatar, "stats": stats}
+            except Exception as exc:
+                logger.info(f"[kuaishou] sync_profile error: {exc}")
+                return {"name": "", "avatar": "", "stats": []}
+            finally:
                 await context.close()
-            except Exception:
-                pass
+        finally:
             try:
                 await browser.close()
             except Exception:
                 pass
+
+
+    async def _scrape_kuaishou_stats(self, page) -> list:
+            """抓取快手创作者中心右上角弹出的 popover 中的运营数据。
+
+            页面 DOM 结构(参见用户提供的 2026-07-19 抓取样本):
+                <div class="user-info-dpd ...">  <!-- 触发器 -->
+                    <img class="user-info-avatar" src="...">
+                    <div class="user-info-name">菜鸡说电影CJ</div>
+                </div>
+                <!-- 点击后弹出 -->
+                <div class="el-popover ... user-info-popper">
+                    <div class="header-info-card">
+                        <img class="user-image">
+                        <div class="user-name">菜鸡说电影CJ</div>
+                        <div class="user-cnt">
+                            <div class="user-cnt__item">25<span>粉丝</span></div>
+                            <div class="user-cnt__item">7<span>关注</span></div>
+                            <div class="user-cnt__item">125<span>获赞</span></div>
+                        </div>
+                    </div>
+                </div>
+
+            Returns:
+                list[dict]: 按 SORT 排序的运营数据列表
+            """
+            stats = []
+            label_map = {
+                "粉丝": ("user",   1, "粉丝"),
+                "关注": ("follow", 2, "关注"),
+                "获赞": ("like",   3, "获赞"),
+            }
+
+            try:
+                # 点击右上角用户头像触发 popover
+                trigger = page.locator(".user-info-dpd").first
+                if await trigger.count() > 0:
+                    try:
+                        await trigger.click()
+                    except Exception:
+                        pass
+
+                try:
+                    await page.wait_for_selector(".user-cnt__item", timeout=6000)
+                except Exception:
+                    logger.info("[kuaishou stats] 等待 .user-cnt__item 超时")
+
+                raw = await page.evaluate(
+                    '''() => {
+                        const out = [];
+                        document.querySelectorAll('.user-cnt__item').forEach(div => {
+                            // label 在嵌套的 span 里,数字是文本节点
+                            const spans = div.querySelectorAll('span');
+                            let label = '';
+                            spans.forEach(s => {
+                                const t = (s.textContent || '').trim();
+                                if (t) label = t;
+                            });
+                            // 数字 = div 的第一个文本节点(去掉 label span 的内容)
+                            const numText = (div.childNodes[0] ? div.childNodes[0].textContent : '').trim();
+                            if (label) out.push({label, num: numText});
+                        });
+                        return out;
+                    }'''
+                )
+                for item in raw:
+                    label = item.get('label', '')
+                    if label in label_map:
+                        icon, sort_no, name = label_map[label]
+                        try:
+                            count = int(str(item.get('num', '0')).replace(',', '').replace(' ', '') or '0')
+                        except (ValueError, TypeError):
+                            count = 0
+                        stats.append({"ICON": icon, "COUNT": count, "NAME": name, "SORT": sort_no})
+
+                # 关闭 popover(点击页面其他位置)
+                try:
+                    await page.mouse.click(10, 10)
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.info(f"[kuaishou stats] 抓取失败: {exc}")
+
+            stats.sort(key=lambda x: x.get("SORT", 999))
+            return stats
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用 _scrape_kuaishou_stats 抓取逻辑,
+        保证"登录后同步"和"同步按钮"看到的运营数据完全一致。
+        """
+        try:
+            try:
+                if not page.url.startswith(_KS_UPLOAD_URL):
+                    await page.goto(_KS_UPLOAD_URL, timeout=15000)
+                    await page.wait_for_load_state("domcontentloaded")
+            except Exception:
+                pass
+            return await self._scrape_kuaishou_stats(page)
+        except Exception as exc:
+            logger.info(f"[kuaishou login] _login_stats_fn 抓取失败: {exc}")
+            return []
 
     # ------------------------------------------------------------------
     # Open creator centre — KEEP AS-IS (sync CloakBrowser)
@@ -460,7 +595,7 @@ class KuaishouPlatform(BasePlatform):
                     await context.close()
         finally:
             if not dry_run:
-                await browser.close()
+                await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Publish video
@@ -526,6 +661,9 @@ class KuaishouPlatform(BasePlatform):
         thumbnail_path = kwargs.get("thumbnail_path", "")
         thumbnail_landscape_path = kwargs.get("thumbnail_landscape_path", "")
         thumbnail_portrait_path = kwargs.get("thumbnail_portrait_path", "")
+        # 视频方向(来自素材表 orientation, app.py 已推导为 landscape/portrait):
+        # 快手封面弹窗需据此点选「裁剪比例」(横版→4:3, 竖版→3:4)
+        video_format = kwargs.get("video_format", "") or "landscape"
         desc = kwargs.get("desc", "")
         schedule_time_str = kwargs.get("schedule_time_str", "")
         # 作者声明：前端 aiContent 字段经 app.py 透传为 ai_content
@@ -533,8 +671,8 @@ class KuaishouPlatform(BasePlatform):
         # author_declaration 仅作别名兼容旧调用
         author_declaration = kwargs.get("ai_content", "") or kwargs.get("author_declaration", "")
 
-        # 优先使用竖版封面，其次横版，最后通用封面
-        cover_path = thumbnail_portrait_path or thumbnail_landscape_path or thumbnail_path
+        # 固定使用 4:3 横版封面（用户要求），竖版/通用仅作缺失兜底
+        cover_path = thumbnail_landscape_path or thumbnail_portrait_path or thumbnail_path
 
         # 打印发布参数摘要
         logger.info("[发布参数] 标题: %s", title)
@@ -580,6 +718,7 @@ class KuaishouPlatform(BasePlatform):
                         author_declaration=author_declaration,
                         publish_date=pub_date,
                         enable_timer=enable_timer,
+                        video_format=video_format,
                     )
 
         logger.info("=" * 60)
@@ -601,6 +740,7 @@ class KuaishouPlatform(BasePlatform):
         author_declaration: str,
         publish_date,
         enable_timer: bool,
+        video_format: str = "landscape",
     ):
         browser = await self.create_browser(headless=False)
         upload_success = False
@@ -640,7 +780,8 @@ class KuaishouPlatform(BasePlatform):
             logger.info("[填写简介] 开始填写简介与标签...")
             await page.get_by_text("描述").locator("xpath=following-sibling::div").click()
             # 清空后输入(跨平台:Mac 用 Cmd+A,其他用 Ctrl+A)
-            await clear_and_type(page, desc or title)
+            # 描述为空时不再回落标题：描述就保持为空
+            await clear_and_type(page, desc)
             await page.keyboard.press("Enter")
             logger.info("[填写简介] 简介填写完成")
 
@@ -652,8 +793,11 @@ class KuaishouPlatform(BasePlatform):
 
 
             # ------ Wait for upload to complete (no timeout — wait indefinitely) ------
+            # 注：浏览器被用户关闭时, _browser.create_browser 的 watchdog 会 cancel
+            # 当前 task, CancelledError 不被 except Exception 捕获, 循环自然终止。
             retry = 0
             while True:
+                raise_if_page_closed(page)
                 try:
                     if await page.locator("text=上传中").count() == 0:
                         logger.info("[上传视频] 视频上传成功!")
@@ -674,7 +818,7 @@ class KuaishouPlatform(BasePlatform):
             logger.info("[设置封面] 封面路径: %s", thumbnail_path)
             if thumbnail_path:
                 logger.info("[设置封面] 开始设置视频封面...")
-                await self._set_thumbnail(page, thumbnail_path)
+                await self._set_thumbnail(page, thumbnail_path, video_format)
                 logger.info("[设置封面] 封面设置完成")
             else:
                 logger.info("[设置封面] 未提供封面路径, 跳过封面设置")
@@ -695,6 +839,10 @@ class KuaishouPlatform(BasePlatform):
             # ------ Click publish ------
             logger.info("[发布] 正在点击发布按钮...")
             while True:
+                # 注：浏览器被用户关闭时, watchdog 会 cancel 当前 task,
+                # CancelledError 不被 except Exception 捕获, 循环自然终止;
+                # 页面级守卫做兜底(watchdog 在 CloakBrowser 下未必可靠)。
+                raise_if_page_closed(page)
                 try:
                     publish_btn = page.get_by_text("发布", exact=True)
                     if await publish_btn.count() > 0:
@@ -726,7 +874,7 @@ class KuaishouPlatform(BasePlatform):
             except Exception:
                 pass
             try:
-                await browser.close()
+                await self.close_browser(browser, is_close_by_code=True)
             except Exception:
                 pass
 
@@ -872,13 +1020,14 @@ class KuaishouPlatform(BasePlatform):
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _set_thumbnail(page, thumbnail_path: str):
+    async def _set_thumbnail(page, thumbnail_path: str, video_format: str = "landscape"):
         """Upload custom cover image.
 
         Flow: hover cover area -> click "封面设置" -> modal ->
-        "上传封面" tab -> upload image -> confirm.
+        "上传封面" tab -> select crop ratio (横版4:3/竖版3:4) ->
+        upload image -> confirm.
         """
-        logger.info("[封面] 开始设置视频封面: %s", thumbnail_path)
+        logger.info("[封面] 开始设置视频封面: %s (方向=%s)", thumbnail_path, video_format)
         try:
             # 1. Hover over cover area to reveal "封面设置" overlay
             cover_area = page.locator("div[class*='default-cover']").first
@@ -905,7 +1054,34 @@ class KuaishouPlatform(BasePlatform):
             await upload_tab.click()
             await asyncio.sleep(1)
 
-            # 5. Find hidden file input and upload image
+            # 5. Select crop ratio (裁剪比例)
+            #    快手封面弹窗右侧有「裁剪比例」选项(原始比例/4:3/3:4/1:1/9:16),
+            #    DOM: div[class*='_ratio-item'] 内 <span> 文案为比例值。
+            #    固定选 4:3(用户要求,与上传的 4:3 封面文件一致),不按视频方向区分。
+            #    失败仅 warning, 不阻塞上传。
+            target_ratio = "4:3"
+            logger.info("[封面] 正在选择裁剪比例: %s", target_ratio)
+            try:
+                # 精确定位: ratio-item 内 span 文本 == 目标比例, 取其父级 item 点击。
+                # DOM: div[class*='_ratio-item'] > span(比例文案) + div[class*='_tag'](推荐标签)
+                ratio_item = modal.locator(
+                    f"div[class*='_ratio-item']:has(span:text-is('{target_ratio}'))"
+                ).first
+                # 注意: wait_for 成功时返回 None(不能用作 if 条件!),
+                # 匹配失败才抛异常 → 由外层 except 捕获。
+                await ratio_item.wait_for(state="visible", timeout=5000)
+                # 已是 _active 态则无需重复点击
+                cls = await ratio_item.get_attribute("class") or ""
+                if "_active" in cls:
+                    logger.info("[封面] 裁剪比例 %s 已是选中态, 跳过点击", target_ratio)
+                else:
+                    await ratio_item.click()
+                    logger.info("[封面] 已选择裁剪比例: %s", target_ratio)
+                    await asyncio.sleep(1)
+            except Exception as ratio_exc:
+                logger.info("[封面] 选择裁剪比例失败(继续上传): %s", ratio_exc)
+
+            # 6. Find hidden file input and upload image
             file_input = modal.locator("input[type='file']")
             logger.info("[封面] 正在上传封面图片...")
             await file_input.wait_for(state="attached", timeout=30000)
@@ -913,14 +1089,14 @@ class KuaishouPlatform(BasePlatform):
             logger.info("[封面] 封面图片已上传, 等待处理...")
             await asyncio.sleep(3)
 
-            # 6. Click "确认" or "完成" button
+            # 7. Click "确认" or "完成" button
             confirm_btn = modal.locator("button:has-text('确认'), button:has-text('完成')").first
             logger.info("[封面] 正在点击确认按钮...")
             await confirm_btn.wait_for(state="visible", timeout=10000)
             await confirm_btn.click()
             await asyncio.sleep(2)
 
-            # 7. Wait for modal to close
+            # 8. Wait for modal to close
             try:
                 await modal.wait_for(state="hidden", timeout=30000)
             except Exception:

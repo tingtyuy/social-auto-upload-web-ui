@@ -9,8 +9,16 @@ export const useAccountStore = defineStore('account', () => {
   
   // 设置账号列表
   const setAccounts = (accountsData) => {
-    // 转换后端返回的数据格式为前端使用的格式
+    // 后端 SELECT * 列顺序:id/type/filePath/userName/status/avatar/fans/likes/follows/stats,
+    // 然后 row.append(tags) → tags 为最后一列。stats 是 JSON 字符串,需要解析。
     accounts.value = accountsData.map(item => {
+      let stats = []
+      const rawStats = item[9]
+      if (typeof rawStats === 'string' && rawStats) {
+        try { stats = JSON.parse(rawStats) } catch { stats = [] }
+      } else if (Array.isArray(rawStats)) {
+        stats = rawStats
+      }
       return {
         id: item[0],
         type: item[1],
@@ -19,7 +27,11 @@ export const useAccountStore = defineStore('account', () => {
         status: item[4] === -1 ? '验证中' : (item[4] === 1 ? '正常' : '异常'),
         platform: platformIdToName[item[1]] || '未知',
         avatar: item[5] || '',
-        tags: item[6] || []
+        fans: item[6] || 0,
+        likes: item[7] || 0,
+        follows: item[8] || 0,
+        stats,
+        tags: item[10] || item[item.length - 1] || []
       }
     })
   }

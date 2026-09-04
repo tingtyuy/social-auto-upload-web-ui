@@ -6,10 +6,13 @@ All browser operations go through the BasePlatform browser entry points
 CloakBrowser via ``_browser.py``.
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -96,6 +99,43 @@ class BilibiliPlatform(BasePlatform):
     platform_key = "bilibili"
     platform_name = "B站"
 
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    # B站 cookie 全部由 .bilibili.com 域下发，覆盖 account/member 子域
+    platform_cookie_domain = ".bilibili.com"
+
+    def _parse_cookie_to_storage_state(
+        self, cookie_str: str
+    ) -> tuple[list[dict], list[dict]]:
+        """把 'k=v; k=v' 解析为 Playwright storage_state 的 (cookies, origins)。
+
+        - 全部 cookie 归属 ``platform_cookie_domain`` (.bilibili.com)
+        - expires 给 7 天保守占位，sync_profile 跑完后 storage_state 会被
+          回写为真实的 cookie（含真实 expires + localStorage）
+        - localStorage 留空，由 sync_profile 自然补全
+        """
+        cookies: list[dict] = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": self.platform_cookie_domain,
+                "path": "/",
+                "expires": expires,
+                "httpOnly": True,
+                "secure": False,
+                "sameSite": "Lax",
+            })
+        logger.info(
+            f"[bilibili] cookie 解析: {len(cookies)} 条, domain={self.platform_cookie_domain}"
+        )
+        return cookies, []
+
     # ------------------------------------------------------------------
     # Login
     # ------------------------------------------------------------------
@@ -170,6 +210,10 @@ class BilibiliPlatform(BasePlatform):
                     status_queue=status_queue,
                     scrape_fn=scrape_bilibili_profile,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(粉丝/点赞/收藏/投币/...),
+                    # 避免登录后还需用户再点"同步"才能看到运营数据。
+                    # 与 sync_profile 内部抓取逻辑共用同一个 _scrape_bilibili_stats 方法。
+                    stats_fn=self._login_stats_fn,
                 )
                 success = True
             finally:
@@ -219,27 +263,173 @@ class BilibiliPlatform(BasePlatform):
     # Sync profile
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Bilibili account centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """Sync profile info (name, avatar, stats) from Bilibili creator centre.
+
+        抓取流程(无头模式):
+        1. 访问 https://account.bilibili.com/account/home 抓 name/avatar
+        2. 跳转到 https://member.bilibili.com/platform/home 抓 8 项 stats
+           (播放量/评论/弹幕/点赞/分享/收藏/投币/粉丝总数)
+
+        共 8 项运营数据。前端会按 SORT 排序后展示前 3 项(粉丝/点赞/收藏),
+        其余进入"更多"悬浮窗展示全部 8 项。
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
-        url = "https://account.bilibili.com/account/home"
 
         browser = await self.create_browser(headless=True)
         try:
             context = await self.create_context(browser, storage_state=cookie_path)
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-                name, avatar = await scrape_bilibili_profile(page)
-                return name, avatar
+                # Step 1: 抓 name/avatar
+                try:
+                    await page.goto("https://account.bilibili.com/account/home",
+                                    wait_until="networkidle", timeout=30000)
+                    name, avatar = await scrape_bilibili_profile(page)
+                except Exception as exc:
+                    logger.info(f"[bilibili] 抓 name/avatar 失败: {exc}")
+                    name, avatar = "", ""
+
+                # Step 2: 跳到创作中心抓 stats
+                try:
+                    await page.goto("https://member.bilibili.com/platform/home",
+                                    wait_until="networkidle", timeout=30000)
+                    stats = await self._scrape_bilibili_stats(page)
+                except Exception as exc:
+                    logger.info(f"[bilibili] 抓 stats 失败(不影响 name/avatar): {exc}")
+                    stats = []
+
+                return {"name": name, "avatar": avatar, "stats": stats}
             except Exception as e:
                 logger.info(f"[bilibili] sync profile failed: {e}")
-                return "", ""
+                return {"name": "", "avatar": "", "stats": []}
             finally:
-                await page.close()
-                await context.close()
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass
         finally:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用同一个 _scrape_bilibili_stats 抓取逻辑,
+        保证"登录后同步"和"同步按钮"看到的运营数据完全一致。
+        """
+        try:
+            await page.goto(
+                "https://member.bilibili.com/platform/home",
+                wait_until="networkidle",
+                timeout=30000,
+            )
+            return await self._scrape_bilibili_stats(page)
+        except Exception as exc:
+            logger.info(f"[bilibili login] _login_stats_fn 抓取失败: {exc}")
+            return []
+
+
+    async def _scrape_bilibili_stats(self, page) -> list:
+            """抓取 B 站创作中心首页的 8 项运营数据。
+
+            页面 DOM 结构(参见用户提供的 2026-07-19 抓取样本):
+                <div class="video section">
+                  <div class="section-row first">
+                    <div class="data-card ct-info-card"><div class="name">播放量</div><div class="value">1,114</div></div>
+                    <div class="data-card ct-info-card"><div class="name">评论</div><div class="value">15</div></div>
+                    <div class="data-card ct-info-card"><div class="name">弹幕</div><div class="value">2</div></div>
+                  </div>
+                  <div class="section-row">
+                    <div class="data-card"><div class="name">点赞</div><div class="value">83</div></div>
+                    <div class="data-card"><div class="name">分享</div><div class="value">2</div></div>
+                    <div class="data-card"><div class="name">收藏</div><div class="value">21</div></div>
+                    <div class="data-card"><div class="name">投币</div><div class="value">24</div></div>
+                  </div>
+                </div>
+                <div class="data-right">
+                  <div class="fan-overview">
+                    <div class="fan-item">
+                      <div class="fan-label"><span>粉丝总数</span></div>
+                      <div class="fan-num">1</div>
+                    </div>
+                  </div>
+                </div>
+
+            Returns:
+                list[dict]: 按 SORT 排序的运营数据列表
+            """
+            stats = []
+            # label_map: B 站页面上的中文名 -> (ICON, SORT, 标准化 NAME)
+            # 8 项全部写入 stats;卡片只展示前 3 项(粉丝/点赞/收藏),
+            # 鼠标悬停"更多"占位时通过悬浮窗展示全部 8 项。
+            label_map = {
+                "播放量":  ("play",  5, "播放量"),
+                "评论":    ("chat",  6, "评论"),
+                "弹幕":    ("chat",  7, "弹幕"),
+                "点赞":    ("like",  2, "点赞"),
+                "分享":    ("share", 8, "分享"),
+                "收藏":    ("star",  3, "收藏"),
+                "投币":    ("coin",  4, "投币"),
+                "粉丝总数": ("user",  1, "粉丝"),
+            }
+
+            def _parse_int(text: str) -> int:
+                try:
+                    return int(str(text or '0').replace(',', '').replace(' ', '') or '0')
+                except (ValueError, TypeError):
+                    return 0
+
+            try:
+                try:
+                    await page.wait_for_selector(".data-card .value, .fan-num", timeout=10000)
+                except Exception:
+                    logger.info("[bilibili stats] 等待 .data-card/.fan-num 超时")
+
+                raw = await page.evaluate(
+                    '''() => {
+                        const out = [];
+                        // 视频数据 section: 每个 .data-card 里有 .name 和 .value
+                        document.querySelectorAll('.data-card').forEach(card => {
+                            const nameEl = card.querySelector('.name');
+                            const valEl = card.querySelector('.value');
+                            if (!nameEl || !valEl) return;
+                            const name = nameEl.textContent.trim();
+                            // 去掉图标和空格,只留文字
+                            const clean = name.replace(/\\s+/g, '');
+                            out.push({label: clean, num: valEl.textContent.trim()});
+                        });
+                        // 粉丝概览: .fan-item .fan-label .fan-num
+                        document.querySelectorAll('.fan-item').forEach(item => {
+                            const labelEl = item.querySelector('.fan-label');
+                            const numEl = item.querySelector('.fan-num');
+                            if (!labelEl || !numEl) return;
+                            // fan-label 第一个 span 是文字
+                            const span = labelEl.querySelector('span');
+                            const label = span ? span.textContent.trim() : '';
+                            out.push({label, num: numEl.textContent.trim()});
+                        });
+                        return out;
+                    }'''
+                )
+
+                for item in raw:
+                    label = item.get('label', '')
+                    if label in label_map:
+                        icon, sort_no, name = label_map[label]
+                        count = _parse_int(item.get('num', '0'))
+                        stats.append({"ICON": icon, "COUNT": count, "NAME": name, "SORT": sort_no})
+            except Exception as exc:
+                logger.info(f"[bilibili stats] 抓取失败: {exc}")
+
+            stats.sort(key=lambda x: x.get("SORT", 999))
+            return stats
 
     # ------------------------------------------------------------------
     # Open creator center
@@ -321,8 +511,13 @@ class BilibiliPlatform(BasePlatform):
             # 创作声明直接在主页面设置，保留参数接收以兼容 app.py 调用
             ai_content = kwargs.get("ai_content", "")
             creation_declaration = kwargs.get("creation_declaration", "")
+            # B 站转载来源(创作声明=转载 时必填)
+            bili_repost_source = kwargs.get("bili_repost_source", "")
+            logger.info("[发布参数] B 站转载来源: %r", bili_repost_source or "(空)")
             # B 站合集(账号级)
             bili_collection_name = kwargs.get("bili_collection_name", "")
+            # 是否保留 B 站系统生成的标签(False = 填自己标签前先清空标签栏)
+            bili_keep_system_tags = bool(kwargs.get("bili_keep_system_tags", True))
 
             # 打印发布参数摘要
             logger.info("[发布参数] 标题: %s", title)
@@ -382,6 +577,8 @@ class BilibiliPlatform(BasePlatform):
                             thumbnail_path=thumbnail_path,
                             creation_declaration=creation_declaration,
                             bili_collection_name=bili_collection_name,
+                            bili_repost_source=bili_repost_source,
+                            bili_keep_system_tags=bili_keep_system_tags,
                         )
 
             logger.info("=" * 60)
@@ -407,6 +604,8 @@ class BilibiliPlatform(BasePlatform):
         thumbnail_path: str | None = None,
         creation_declaration: str = "",
         bili_collection_name: str = "",
+        bili_repost_source: str = "",
+        bili_keep_system_tags: bool = True,
     ):
         """Upload a single video to Bilibili using CloakBrowser."""
         log_dir = Path(BASE_DIR / "logs")
@@ -467,8 +666,8 @@ class BilibiliPlatform(BasePlatform):
                 # 4. Set category
                 await self._set_category(page, category)
 
-                # 5. Fill tags
-                await self._fill_tags(page, tags)
+                # 5. Fill tags(按需先清空系统生成的标签)
+                await self._fill_tags(page, tags, clear_existing=not bili_keep_system_tags)
 
                 # 6. Fill description
                 await self._fill_desc(page, desc)
@@ -478,7 +677,8 @@ class BilibiliPlatform(BasePlatform):
 
                 # 8. Set creation declaration (bcc-select dropdown)
                 # B 站新版已废弃"更多设置/声明与权益"，保留创作声明即可
-                await self._set_creation_declaration(page, creation_declaration)
+                # 创作声明=转载 时, 选完后会展开转载来源输入框, 一并填入
+                await self._set_creation_declaration(page, creation_declaration, bili_repost_source)
 
                 # 9. Set scheduled publish
                 if (
@@ -515,6 +715,7 @@ class BilibiliPlatform(BasePlatform):
                 logger.info("[发布调试] 视频文件(file_path): %s", file_path)
                 logger.info("[发布调试] 简介(desc)        : %s", desc[:100] if desc else "(无)")
                 logger.info("[发布调试] 标签(tags)        : %s (共 %d 个)", tags, len(tags))
+                logger.info("[发布调试] 保留系统标签(keep_system_tags): %s", bili_keep_system_tags)
                 logger.info("[发布调试] 分区(category)    : %s", category)
                 logger.info("[发布调试] 封面(thumbnail)   : %s", thumbnail_path or "(无)")
                 logger.info("[发布调试] 创作声明(creation): %s", creation_declaration or "(无)")
@@ -558,9 +759,11 @@ class BilibiliPlatform(BasePlatform):
                             await asyncio.sleep(3)
                             continue
 
-                        await asyncio.sleep(3)
-                        for _ in range(15):
-                            await asyncio.sleep(2)
+                        # 点击后 1s 即开始检测（原 3s+2s 粒度太粗，成功页已
+                        # 出来还要等好几秒才判定）；轮询 1s 一次，总时长不变
+                        await asyncio.sleep(1)
+                        for _ in range(30):
+                            await asyncio.sleep(1)
                             btn_exists = (
                                 await page.locator("span.submit-add").count()
                                 > 0
@@ -615,8 +818,10 @@ class BilibiliPlatform(BasePlatform):
                     )
 
                 if submitted:
-                    logger.info("[上传视频] waiting 10s for processing")
-                    await asyncio.sleep(10)
+                    # 已看到跳转/按钮消失 = 投稿受理成功，不再固定等 10s
+                    # （成功页都出来了还干等，用户体感「判定慢」），2s 稳定后截图
+                    logger.info("[上传视频] submitted, settling 2s")
+                    await asyncio.sleep(2)
                     try:
                         await page.screenshot(
                             path=str(
@@ -637,7 +842,7 @@ class BilibiliPlatform(BasePlatform):
                         pass
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
             logger.info("[上传视频] browser closed")
 
     # ------------------------------------------------------------------
@@ -813,9 +1018,13 @@ class BilibiliPlatform(BasePlatform):
             logger.info(f"[设置分区] category setting failed (non-fatal): {exc}")
 
     @staticmethod
-    async def _fill_tags(page, tags: list):
-        """Fill video tags (up to 10 tags)."""
-        if not tags:
+    async def _fill_tags(page, tags: list, clear_existing: bool = False):
+        """Fill video tags (up to 10 tags).
+
+        clear_existing=True 时先清空标签栏已有标签(B 站会自动生成
+        系统推荐标签,用户关闭「保留系统生成标签」时用)。
+        """
+        if not tags and not clear_existing:
             return
 
         # Parse tags: support "#tag1 #tag2" or "tag1,tag2" or mixed
@@ -863,6 +1072,14 @@ class BilibiliPlatform(BasePlatform):
             )
             return
 
+        # 先清空标签栏已有的(系统生成)标签
+        if clear_existing:
+            await BilibiliPlatform._clear_existing_tags(page)
+
+        # 没有自己的标签要填(纯清空场景)时到此结束
+        if not tags:
+            return
+
         for i, tag in enumerate(tags[:10]):
             try:
                 # Re-locate input after each tag (DOM may change)
@@ -879,9 +1096,20 @@ class BilibiliPlatform(BasePlatform):
                     logger.info("[填写标签] tag input lost, stopping")
                     break
 
+                # click 后等输入框真正可编辑(比固定 sleep 可靠, 避免焦点未稳定
+                # 就输入导致前几个字符被吞——曾出现"杨氏之子"只输入"杨"或"氏之子")。
                 await current_input.click()
-                await asyncio.sleep(0.3)
-                await current_input.type(str(tag), delay=50)
+                try:
+                    await current_input.wait_for(state="editable", timeout=3000)
+                except Exception:
+                    pass
+                # 第一个标签前多等一会(输入框刚展开, React 渲染未稳定)
+                await asyncio.sleep(0.5 if i == 0 else 0.3)
+
+                # press_sequentially 自动 focus 且逐字符触发 input 事件,
+                # 比 type 更稳(CLAUDE.md L74-82 推荐)。delay=100 给 B 站 React
+                # 充分反应时间, 避免快打丢字。
+                await current_input.press_sequentially(str(tag), delay=100)
                 await asyncio.sleep(0.3)
                 await current_input.press("Enter")
                 await asyncio.sleep(0.5)
@@ -891,6 +1119,43 @@ class BilibiliPlatform(BasePlatform):
                 )
             except Exception as exc:
                 logger.info(f"[填写标签] failed to add tag '{tag}': {exc}")
+
+    @staticmethod
+    async def _clear_existing_tags(page) -> int:
+        """清空标签栏已有标签(逐个点标签 chip 的关闭按钮)。
+
+        返回删除的标签数;找不到关闭按钮时返回 0(不报错,发布不中断)。
+        """
+        close_sels = [
+            '[class*="tag"] [class*="close"]',
+            '[class*="tag"] [class*="delete"]',
+            '[class*="tag"] [class*="remove"]',
+            '[class*="tag"] .icon-close',
+        ]
+        removed = 0
+        for _ in range(30):  # 上限 30 个,防死循环
+            btn = None
+            for sel in close_sels:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        btn = loc
+                        break
+                except Exception:
+                    continue
+            if btn is None:
+                break
+            try:
+                await btn.click()
+                removed += 1
+                await asyncio.sleep(0.25)
+            except Exception:
+                break
+        if removed:
+            logger.info("[填写标签] 已清空标签栏原有标签 %d 个", removed)
+        else:
+            logger.info("[填写标签] 标签栏没有可清空的标签(或未匹配到关闭按钮)")
+        return removed
 
     @staticmethod
     async def _fill_desc(page, desc: str):
@@ -942,11 +1207,23 @@ class BilibiliPlatform(BasePlatform):
             )
 
             # Step 1: Open cover editor dialog
-            # 路径：div.cover-main > div.cover-item > div.cover-img > span.edit-text
             # 不使用 data-v-* scoped hash（每次发版会变）
             dialog_opened = False
             trigger_selectors = [
-                # 最精确：完整路径，不依赖 scoped hash
+                # 新版 B 站(2026): cover-module 改版后的封面触发
+                # DOM: .cover-module .cover-empty .cover-empty-pill > (.add-icon + .add-text "添加封面")
+                # 优先点内部 .add-text / .add-icon: 直接点 .cover-empty-pill 时 hit-test
+                # 落在 icon 与 text 之间的缝隙, Vue @click 若绑在子元素则不触发
+                '[data-reporter-id="80"] .cover-empty-pill .add-text',
+                '[data-reporter-id="80"] .cover-empty-pill .add-icon',
+                '.cover-empty-pill .add-text',
+                '.cover-empty-pill .add-icon',
+                'span.add-text:has-text("添加封面")',
+                '.cover-empty-pill',
+                '.cover-empty .cover-empty-pill',
+                '.cover-module .cover-empty-pill',
+                'div[class*="cover-empty"]:has-text("封面")',
+                # 旧版(保留兼容): 完整路径,不依赖 scoped hash
                 'div.cover-main div.cover-item div.cover-img span.edit-text',
                 # class 子串 + 文本
                 '[class*="cover-main"] [class*="cover-item"] [class*="cover-img"] [class*="edit-text"]',
@@ -968,15 +1245,30 @@ class BilibiliPlatform(BasePlatform):
                 'div[class*="cover"] >> text=选择封面',
                 'div[class*="cover"] >> text=封面',
             ]
+            # 三档点击策略: 普通 click → force click(绕过 hit-test) → dispatch_event(合成事件)
+            # 同一 selector 失败后,先升级策略再换下一个 selector,避免漏掉命中元素
             for sel in trigger_selectors:
-                count = await page.locator(sel).count()
-                if count > 0:
+                loc = page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                for strategy in ("normal", "force", "dispatch"):
                     try:
-                        await page.locator(sel).first.click(timeout=3000)
+                        if strategy == "normal":
+                            await loc.click(timeout=3000)
+                        elif strategy == "force":
+                            await loc.click(timeout=3000, force=True)
+                        else:
+                            await loc.dispatch_event("click")
                         dialog_opened = True
+                        logger.info(
+                            "[设置封面] trigger clicked via %s strategy: %s",
+                            strategy, sel,
+                        )
                         break
                     except Exception:
                         continue
+                if dialog_opened:
+                    break
 
             if not dialog_opened:
                 logger.info(
@@ -986,22 +1278,36 @@ class BilibiliPlatform(BasePlatform):
                 return
 
             # Wait for cover editor dialog
-            # 兼容旧版"封面制作"和新版"封面设置"两种标题
+            # 兼容旧版"封面制作"/"封面设置"(bcc-dialog)和新版弹窗(可能改用别的容器)
             dialog = None
             for dialog_sel in [
                 'div.bcc-dialog:has-text("封面制作")',
                 'div.bcc-dialog:has-text("封面设置")',
                 'div.bcc-dialog',
+                # 新版可能用的弹窗容器
+                'div[class*="cover-editor"]:visible',
+                'div[class*="cover-dialog"]:visible',
+                'div[class*="upload-cover"]:visible',
             ]:
                 cand = page.locator(dialog_sel).first
                 try:
-                    await cand.wait_for(state="visible", timeout=8000)
+                    await cand.wait_for(state="visible", timeout=5000)
                     dialog = cand
                     break
                 except Exception:
                     continue
             if dialog is None:
-                raise RuntimeError("封面编辑弹窗未出现")
+                # 兜底:弹窗容器选择器都没命中,但若页面已出现图片上传 input,
+                # 说明封面编辑器其实已打开(只是 DOM 结构变了),继续往下走
+                has_input = await page.locator(
+                    'input[type="file"][accept*="image"]'
+                ).count()
+                if has_input > 0:
+                    logger.info("[设置封面] 弹窗容器选择器未命中,但检测到图片上传 input,继续")
+                    # dialog 用 page 兜底,后续 confirm 按钮查找走 page
+                    dialog = page
+                else:
+                    raise RuntimeError("封面编辑弹窗未出现")
             await asyncio.sleep(1)
             await asyncio.sleep(1)
 
@@ -1090,10 +1396,12 @@ class BilibiliPlatform(BasePlatform):
             raise RuntimeError(f"cover setting failed: {exc}") from exc
 
     @staticmethod
-    async def _set_creation_declaration(page, creation_declaration: str):
+    async def _set_creation_declaration(page, creation_declaration: str, repost_source: str = ""):
         """Set creation declaration via bcc-select dropdown.
 
         Only shown for some accounts. Silently skipped when not found.
+        创作声明选「内容为转载」时, B 站会展开转载来源输入框(.statement-source
+        input.input-val), 此处一并填入 repost_source(转载来源, B 站要求必填)。
         """
         if not creation_declaration:
             return
@@ -1188,6 +1496,32 @@ class BilibiliPlatform(BasePlatform):
                 )
 
             await asyncio.sleep(1)
+
+            # 创作声明=转载 时, B 站会展开转载来源输入框(B 站要求必填)。
+            # DOM: div.statement-source input.input-val
+            #      (placeholder 含「转载视频请注明来源」)
+            # 选的不是转载则没有该输入框, 自然跳过。
+            if clicked and target_text == "内容为转载" and repost_source:
+                try:
+                    repost_input = page.locator(
+                        'div.statement-source input.input-val'
+                    ).first
+                    # 注意: wait_for 成功返回 None(不能作 if 条件!),
+                    # 否则填入块被静默跳过。失败才抛异常 → 走 except。
+                    await repost_input.wait_for(state="visible", timeout=3000)
+                    await repost_input.click()
+                    await repost_input.fill("")
+                    await repost_input.press_sequentially(repost_source, delay=30)
+                    logger.info(
+                        f"[上传视频] repost source filled: "
+                        f"{repost_source}"
+                    )
+                    await asyncio.sleep(0.5)
+                except Exception as repost_exc:
+                    logger.info(
+                        f"[上传视频] repost source fill failed (non-fatal): "
+                        f"{repost_exc}"
+                    )
         except Exception as exc:
             logger.info(
                 f"[上传视频] creation declaration failed (non-fatal): "

@@ -3,14 +3,17 @@
     <!-- Sidebar -->
     <div class="sidebar" :class="{ expanded: !sidebarCollapsed }">
       <div class="sidebar-top">
-        <div class="logo">S</div>
+        <div class="logo">
+          <el-icon :size="18" class="logo-icon"><Promotion /></el-icon>
+          <span v-if="!sidebarCollapsed" class="logo-text">千帆云递</span>
+        </div>
         <button class="toggle-btn" @click="sidebarCollapsed = !sidebarCollapsed">
           <el-icon :size="16"><component :is="sidebarCollapsed ? Expand : Fold" /></el-icon>
         </button>
       </div>
 
-      <div class="sidebar-nav">
-        <template v-for="item in navItems" :key="item.path">
+<div class="sidebar-nav">
+        <template v-for="item in navItems" :key="item.title">
           <el-tooltip v-if="sidebarCollapsed" :content="item.title" effect="dark" placement="right">
             <div
               class="nav-item"
@@ -35,24 +38,61 @@
       <div class="sidebar-separator"></div>
 
       <div class="sidebar-bottom">
-        <el-tooltip v-if="sidebarCollapsed" :content="settingsItem.title" effect="dark" placement="right">
-          <div
-            class="nav-item"
-            :class="{ active: activeMenu === settingsItem.path }"
-            @click="router.push(settingsItem.path)"
-          >
-            <el-icon :size="20"><component :is="settingsItem.icon" /></el-icon>
-          </div>
-        </el-tooltip>
-        <div
-          v-else
-          class="nav-item expanded-item"
-          :class="{ active: activeMenu === settingsItem.path }"
-          @click="router.push(settingsItem.path)"
+        <!-- 主题切换：放在 sidebar 底部，明显位置;折叠态只显图标,展开态显「图标 + 当前模式」 -->
+        <button
+          class="theme-toggle"
+          :class="{ expanded: !sidebarCollapsed }"
+          @click="appStore.toggleTheme"
         >
-          <el-icon :size="20"><component :is="settingsItem.icon" /></el-icon>
-          <span class="nav-label">{{ settingsItem.title }}</span>
-        </div>
+          <el-icon :size="16">
+            <component :is="appStore.theme === 'dark' ? Sunny : Moon" />
+          </el-icon>
+          <span v-if="!sidebarCollapsed" class="theme-label">
+            {{ appStore.theme === 'dark' ? '暗色' : '亮色' }}
+          </span>
+          <span v-if="!sidebarCollapsed" class="theme-hint">点击切换</span>
+        </button>
+        <template v-for="item in bottomItems" :key="item.path">
+          <!-- 折叠态 -->
+          <el-tooltip v-if="sidebarCollapsed" :content="item.title" effect="dark" placement="right">
+            <div
+              class="nav-item"
+              :class="[ item._isSponsor ? 'sponsor-item' : '', { active: activeMenu === item.path } ]"
+              @click="router.push(item.path)"
+            >
+              <el-icon :size="20"><component :is="item.icon" /></el-icon>
+              <span v-if="item._isSponsor" class="sponsor-dot"></span>
+            </div>
+          </el-tooltip>
+
+          <!-- 展开态 -->
+          <div
+            v-else
+            class="nav-item expanded-item"
+            :class="[ item._isSponsor ? 'sponsor-item sponsor-item--wide' : '', { active: activeMenu === item.path } ]"
+            @click="router.push(item.path)"
+          >
+            <!-- 左侧品牌竖条 -->
+            <span v-if="item._isSponsor" class="sponsor-bar"></span>
+
+            <el-icon :size="item._isSponsor ? 22 : 20"><component :is="item.icon" /></el-icon>
+            <span class="nav-label">{{ item.title }}</span>
+
+            <!-- 打赏头像气泡（仅赞助项，展开态） -->
+            <div v-if="item._isSponsor" class="sponsor-bubbles">
+              <transition name="bubble" mode="out-in">
+                <div
+                  class="bubble"
+                  :key="currentBubbleIndex"
+                  :style="{ '--bubble-color': sponsorBubbles[currentBubbleIndex].color }"
+                >
+                  <div class="bubble-avatar">{{ sponsorBubbles[currentBubbleIndex].name[0] }}</div>
+                  <span class="bubble-amt">+¥{{ sponsorBubbles[currentBubbleIndex].amount }}</span>
+                </div>
+              </transition>
+            </div>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -61,7 +101,7 @@
       <!-- Header -->
       <header class="header">
         <div class="breadcrumb">{{ pageTitle }}</div>
-        <div class="header-right"></div>
+        <!-- 主题切换已移至 sidebar 底部(更显眼) -->
       </header>
 
       <!-- Content -->
@@ -79,14 +119,18 @@ import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   HomeFilled, User, Picture, Upload,
-  Clock, Setting, Expand, Fold, UserFilled, Document, Notebook, ChatDotRound
+  Clock, Setting, Expand, Fold, UserFilled, Document, Notebook, ChatDotRound,
+  Sunny, Moon, Coffee, Promotion
 } from '@element-plus/icons-vue'
+import { useAppStore } from '@/stores/app'
 
 const route = useRoute()
 const router = useRouter()
+const appStore = useAppStore()
 
 const sidebarCollapsed = ref(false)
 
+// 菜单项数据
 const navItems = [
   { path: '/', icon: HomeFilled, title: '仪表盘' },
   { path: '/account-management', icon: User, title: '账号管理' },
@@ -101,7 +145,23 @@ const navItems = [
   { path: '/feedback', icon: ChatDotRound, title: '一键反馈' }
 ]
 
-const settingsItem = { path: '/settings', icon: Setting, title: '系统设置' }
+// 底部区：赞助作者（醒目版）+ 系统设置
+const bottomItems = [
+  { path: '/sponsor', icon: Coffee, title: '赞助作者', _isSponsor: true },
+  { path: '/settings', icon: Setting, title: '系统设置' }
+]
+
+// 打赏头像气泡（循环展示，给赞助项制造"有人在打赏"的氛围）
+const sponsorBubbles = [
+  { name: '小张', amount: 88, color: '#f43f5e' },
+  { name: '阿杰', amount: 50, color: '#06b6d4' },
+  { name: 'Vivi', amount: 128, color: '#22c55e' },
+  { name: '老王', amount: 20, color: '#f59e0b' }
+]
+const currentBubbleIndex = ref(0)
+setInterval(() => {
+  currentBubbleIndex.value = (currentBubbleIndex.value + 1) % sponsorBubbles.length
+}, 4000)
 
 const activeMenu = computed(() => route.path)
 
@@ -119,7 +179,7 @@ const pageTitle = computed(() => route.meta?.title || '')
 // ---- Sidebar ----
 .sidebar {
   width: 64px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba($overlay-rgb, 0.03);
   border-right: 1px solid $border;
   display: flex;
   flex-direction: column;
@@ -137,6 +197,21 @@ const pageTitle = computed(() => route.meta?.title || '')
     .sidebar-top {
       justify-content: space-between;
       padding-right: 0;
+
+      .logo {
+        // 展开态：胶囊形「图标 + 千帆云递」
+        width: auto;
+        height: 36px;
+        padding: 0 12px;
+        border-radius: 10px;
+        gap: 8px;
+        justify-content: flex-start;
+        font-weight: 600;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+
+        .logo-text { display: inline; white-space: nowrap; }
+      }
     }
 
     .sidebar-nav {
@@ -172,17 +247,23 @@ const pageTitle = computed(() => route.meta?.title || '')
     gap: 4px;
 
     .logo {
+      // 折叠态：圆形 36x36 图标
       width: 36px;
       height: 36px;
       border-radius: 50%;
+      padding: 0;
       background: $gradient-brand;
       display: flex;
       align-items: center;
       justify-content: center;
+      gap: 0;
       color: #fff;
-      font-weight: 700;
-      font-size: 16px;
       flex-shrink: 0;
+      overflow: hidden;
+      transition: $transition-base;
+
+      .logo-icon { font-size: 18px; }
+      .logo-text { display: none; }
     }
   }
 
@@ -201,7 +282,7 @@ const pageTitle = computed(() => route.meta?.title || '')
     flex-shrink: 0;
 
     &:hover {
-      background: rgba(255, 255, 255, 0.06);
+      background: rgba($overlay-rgb, 0.06);
       color: $text-secondary;
     }
   }
@@ -238,9 +319,10 @@ const pageTitle = computed(() => route.meta?.title || '')
     transition: $transition-base;
     color: $text-muted;
     white-space: nowrap;
+    position: relative;
 
     &:hover {
-      background: rgba(255, 255, 255, 0.06);
+      background: rgba($overlay-rgb, 0.06);
       color: $text-secondary;
     }
 
@@ -255,6 +337,178 @@ const pageTitle = computed(() => route.meta?.title || '')
       font-weight: 500;
     }
   }
+
+  // ============== 赞助作者 醒目版（A 方案：底部独立） ==============
+  .sponsor-item {
+    .el-icon {
+      color: $accent-rose;
+    }
+
+    // 折叠态右上角红点（呼吸）
+    .sponsor-dot {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: $accent-rose;
+      box-shadow: 0 0 0 2px var(--sidebar-bg, transparent);
+      animation: sponsor-pulse 1.8s ease-in-out infinite;
+    }
+
+    &:hover .el-icon { color: $brand-start; }
+    &.active .el-icon { color: #fff; }
+  }
+
+  // 展开态：加重版（更高、更亮、呼吸更强、左侧竖条）
+  .sponsor-item--wide {
+    height: 46px;
+    border-radius: $radius-base;
+    background: linear-gradient(135deg, rgba($accent-rose, 0.16), rgba($brand-start, 0.10));
+    border: 1px solid rgba($accent-rose, 0.28);
+    overflow: visible;
+    position: relative;
+
+    // 呼吸光晕
+    &::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: $radius-base;
+      background: linear-gradient(135deg, rgba($accent-rose, 0.18), rgba($brand-start, 0.12));
+      animation: sponsor-breathe 1.8s ease-in-out infinite;
+      z-index: -1;
+    }
+
+    // 左侧品牌竖条
+    .sponsor-bar {
+      position: absolute;
+      left: -1px;
+      top: 8px;
+      bottom: 8px;
+      width: 3px;
+      border-radius: 0 3px 3px 0;
+      background: $gradient-brand;
+      box-shadow: 0 0 8px rgba($accent-rose, 0.6);
+    }
+
+    .el-icon {
+      background: $gradient-brand;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .nav-label {
+      background: $gradient-brand;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      font-weight: 600;
+      font-size: 13.5px;
+    }
+
+    &:hover {
+      background: linear-gradient(135deg, rgba($accent-rose, 0.22), rgba($brand-start, 0.16));
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba($accent-rose, 0.15);
+    }
+
+    &.active {
+      background: $gradient-brand;
+      border-color: transparent;
+      .nav-label, .el-icon {
+        -webkit-text-fill-color: #fff;
+        background: none;
+      }
+    }
+  }
+
+  // 打赏头像气泡（仅展开态）
+  .sponsor-bubbles {
+    margin-left: auto;
+    padding-right: 2px;
+    position: relative;
+    width: 64px;
+    height: 22px;
+    overflow: visible;
+  }
+
+  .bubble {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    padding: 0 8px 0 3px;
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+    position: absolute;
+    right: 0;
+    top: 0;
+    animation: bubble-pop 4s ease-out forwards;
+  }
+
+  .bubble-avatar {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--bubble-color);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .bubble-amt {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--bubble-color);
+    white-space: nowrap;
+  }
+}
+
+@keyframes sponsor-pulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 2px var(--sidebar-bg, transparent), 0 0 0 0 rgba(244, 63, 94, 0.6);
+  }
+  50% {
+    transform: scale(1.15);
+    box-shadow: 0 0 0 2px var(--sidebar-bg, transparent), 0 0 0 6px rgba(244, 63, 94, 0);
+  }
+}
+
+@keyframes sponsor-breathe {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.9; }
+}
+
+// 打赏气泡：向上漂 + 淡入淡出（4s 循环）
+@keyframes bubble-pop {
+  0% { transform: translateY(8px) scale(0.6); opacity: 0; }
+  15% { transform: translateY(0) scale(1); opacity: 1; }
+  75% { transform: translateY(-4px) scale(1); opacity: 1; }
+  100% { transform: translateY(-12px) scale(0.9); opacity: 0; }
+}
+
+// 气泡切换的过渡（备用，setInterval 已经触发 key 切换）
+.bubble-enter-active,
+.bubble-leave-active {
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+.bubble-enter-from {
+  opacity: 0;
+  transform: translateY(8px) scale(0.8);
+}
+.bubble-leave-to {
+  opacity: 0;
+  transform: translateY(-8px) scale(0.8);
 }
 
 // ---- Main Area ----
@@ -274,7 +528,7 @@ const pageTitle = computed(() => route.meta?.title || '')
 
 .header {
   height: 48px;
-  background: rgba(255, 255, 255, 0.02);
+  background: rgba($overlay-rgb, 0.02);
   border-bottom: 1px solid $border;
   padding: 0 24px;
   display: flex;
@@ -289,8 +543,83 @@ const pageTitle = computed(() => route.meta?.title || '')
   }
 
   .header-right {
-    // placeholder for future user area
+    // 主题切换已移至 sidebar-bottom（保留 flex 以备未来扩展）
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
+}
+
+// 主题切换按钮：sidebar 底部，胶囊形状，「图标 + 当前模式 + 提示」
+.sidebar .sidebar-bottom .theme-toggle {
+  width: 36px;
+  height: 36px;
+  margin: 0 auto 8px;
+  border: 1px solid $border;
+  border-radius: 18px;
+  background: var(--sidebar-theme-toggle-bg, rgba($overlay-rgb, 0.05));
+  color: $text-secondary;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: $transition-base;
+  position: relative;
+  overflow: hidden;
+
+  &:hover {
+    background: var(--sidebar-theme-toggle-hover-bg, rgba($brand-start, 0.12));
+    color: $brand-start;
+    border-color: rgba($brand-start, 0.3);
+    transform: translateY(-1px);
+  }
+
+  .theme-label,
+  .theme-hint { display: none; }
+
+  // 展开态：胶囊变宽,显模式名 + 「点击切换」提示
+  &.expanded {
+    width: 100%;
+    height: 40px;
+    padding: 0 12px;
+    justify-content: flex-start;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 10px;
+
+    .theme-label {
+      display: inline;
+      flex: 1;
+      text-align: left;
+      letter-spacing: 0.02em;
+    }
+    .theme-hint {
+      display: inline;
+      font-size: 11px;
+      color: $text-muted;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba($overlay-rgb, 0.06);
+    }
+    &:hover .theme-hint {
+      background: rgba($brand-start, 0.15);
+      color: $brand-start;
+    }
+  }
+}
+// 暗色模式下的微调
+html.dark .sidebar .sidebar-bottom .theme-toggle {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.08);
+
+  &:hover {
+    background: rgba($brand-start, 0.18);
+    border-color: rgba($brand-start, 0.4);
+  }
+
+  .theme-hint { background: rgba(255, 255, 255, 0.06); }
 }
 
 .fade-slide-enter-active,

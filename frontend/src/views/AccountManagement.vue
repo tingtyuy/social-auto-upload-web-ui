@@ -6,10 +6,16 @@
           <h1>账号管理</h1>
           <p class="page-subtitle">管理所有平台账号</p>
         </div>
-        <el-button type="primary" class="add-btn" @click="handleAddAccount">
-          <el-icon><Plus /></el-icon>
-          添加账号
-        </el-button>
+        <div class="header-actions">
+          <el-button type="primary" class="add-btn" @click="handleAddAccount">
+            <el-icon><Plus /></el-icon>
+            添加账号
+          </el-button>
+          <el-button class="add-btn import-btn" @click="handleImportAccount">
+            <el-icon><Upload /></el-icon>
+            导入用户
+          </el-button>
+        </div>
       </div>
     </div>
 
@@ -105,6 +111,59 @@
         </div>
 
         <!-- 标签行(独立一行,溢出跑马灯) -->
+        <!-- 账号运营数据(stats JSON),按 SORT 升序,最多展示 4 块,超过走悬浮窗 -->
+        <div class="account-stats-row" :class="{ 'has-overflow': getExtraStats(account).length > 0 }">
+          <!-- 存量数据无运营数据:显示占位提示,引导用户点同步 -->
+          <div v-if="!sortStats(account?.stats).length" class="stat-block-empty">
+            <el-icon class="empty-icon"><Clock /></el-icon>
+            <span class="empty-text">暂无运营数据，点下方同步按钮获取</span>
+          </div>
+
+          <template v-for="(item, idx) in getVisibleStats(account)" :key="`${account.id}-${item.NAME}-${idx}`">
+            <div
+              class="stat-block"
+              :class="[`stat-block-${item.ICON}`, { 'is-empty': !Number(item.COUNT) }]"
+              :title="item.NAME"
+            >
+              <div class="stat-icon-wrap">
+                <component :is="getIconComponent(item.ICON)" />
+              </div>
+              <div class="stat-value">{{ formatStat(item.COUNT) }}</div>
+              <div class="stat-label">{{ item.NAME }}</div>
+            </div>
+          </template>
+
+          <!-- 超出卡片显示位数的(超过 visible count),用"更多"占位 + 原生 CSS hover 浮窗;
+             浮窗在卡片 DOM 内,完全自控,不受全局 popper 样式影响。
+             浮窗位置由 JS 在 mouseenter 时计算,避免最右侧卡片溢出视口触发横向滚动条 -->
+          <div
+            v-if="sortStats(account?.stats).length > getVisibleCount(account)"
+            class="stat-block stat-block-more stats-more-wrap"
+            @mouseenter="handleStatsHover"
+          >
+            <div class="stat-icon-wrap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="5" cy="12" r="1"></circle>
+                <circle cx="12" cy="12" r="1"></circle>
+                <circle cx="19" cy="12" r="1"></circle>
+              </svg>
+            </div>
+            <div class="stat-value">+{{ sortStats(account?.stats).length - getVisibleCount(account) }}</div>
+            <div class="stat-label">更多</div>
+
+            <!-- 悬浮浮窗:绝对定位在 stat-block 上方 -->
+            <div class="stats-more-popover">
+              <div
+                v-for="(item, idx) in getExtraStats(account)"
+                :key="`extra-${item.NAME}-${idx}`"
+                class="stats-more-item"
+              >
+                <span class="name">{{ item.NAME }}</span>
+                <strong class="value">{{ formatStat(item.COUNT) }}</strong>
+              </div>
+            </div>
+          </div>
+        </div>
         <div class="account-tags-row">
           <span class="account-tags-label">标签:</span>
           <div
@@ -223,12 +282,205 @@
       v-model="batchTagDialogVisible"
       @done="onBatchTagDone"
     />
+
+    <!-- 批量检查对话框（复用发布前检查的 4 阶段进度 + 失效自动重登） -->
+    <PrePublishCheckDialog
+      ref="prePublishCheckRef"
+      v-model="prePublishCheckVisible"
+      mode="account-check"
+    />
+
+    <!-- 导入用户对话框：粘贴 cookie 字符串 → 后端 4 步进度 -->
+    <el-dialog
+      v-model="importDialogVisible"
+      :show-close="!importStarted || importDone"
+      :close-on-click-modal="false"
+      :close-on-press-escape="false"
+      :width="importStarted ? '520px' : '660px'"
+      align-center
+      class="import-account-dialog"
+      @close="closeImportDialog"
+    >
+      <template #header>
+        <div class="import-dialog-header">
+          <div class="import-dialog-title">
+            <el-icon class="title-icon"><Upload /></el-icon>
+            <span>导入用户账号</span>
+          </div>
+          <div class="import-dialog-sub">通过 Cookie 字符串快速绑定已有平台账号</div>
+        </div>
+      </template>
+
+      <!-- 输入阶段：左右分栏（左选平台 / 右输入 cookie） -->
+      <template v-if="!importStarted">
+        <div class="import-form-split">
+          <!-- 左：平台扁平卡片列表 -->
+          <div class="split-left">
+            <div class="split-section-label">
+              <span class="dot">●</span>
+              <span>选择平台</span>
+            </div>
+            <el-input
+              v-model="platformSearch"
+              class="platform-search"
+              placeholder="搜索平台..."
+              :prefix-icon="Search"
+              clearable
+              size="small"
+            />
+            <div class="platform-list">
+              <div
+                v-for="p in filteredImportPlatforms"
+                :key="p.id"
+                :class="['platform-card-flat', { 'is-selected': importForm.platformId === p.id }]"
+                @click="importForm.platformId = p.id"
+              >
+                <div class="card-logo-wrap" :style="{ background: getPlatformBg(p.name) }">
+                  <img
+                    v-if="getPlatformLogo(p.name)"
+                    :src="getPlatformLogo(p.name)"
+                    :alt="p.name"
+                    class="card-logo"
+                  />
+                  <span v-else class="card-letter" :style="{ color: getPlatformColor(p.name) }">
+                    {{ p.letter }}
+                  </span>
+                </div>
+                <div class="card-text">
+                  <div class="card-name">{{ p.name }}</div>
+                </div>
+                <el-icon v-if="importForm.platformId === p.id" class="card-check">
+                  <Select />
+                </el-icon>
+              </div>
+              <div v-if="!filteredImportPlatforms.length" class="empty-platform">
+                {{ importSupportedPlatforms.length ? '未匹配到平台' : '暂无支持导入的平台' }}
+              </div>
+            </div>
+          </div>
+
+          <!-- 右：cookie 输入 -->
+          <div class="split-right">
+            <div class="split-section-label">
+              <span class="dot">●</span>
+              <span>Cookie 字符串</span>
+            </div>
+            <el-input
+              v-model="importForm.cookieStr"
+              type="textarea"
+              resize="none"
+              class="import-textarea"
+              placeholder="k1=v1; k2=v2; k3=v3 ..."
+            />
+            <div class="cookie-tip">
+              <el-icon><InfoFilled /></el-icon>
+              <span>从浏览器 DevTools → Network → 任意请求 → Request Headers → Cookie 复制整段</span>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- 进度阶段：自绘 4 步进度条 -->
+      <template v-else>
+        <div class="import-progress">
+          <div class="import-progress-header">
+            <div class="platform-pill" v-if="currentImportPlatform">
+              <span class="platform-letter" :style="{ background: getPlatformColor(currentImportPlatform.name) }">
+                {{ currentImportPlatform.letter }}
+              </span>
+              <span class="platform-name">{{ currentImportPlatform.name }}</span>
+            </div>
+          </div>
+
+          <!-- 顶部进度条 (n/4) -->
+          <div class="progress-bar-wrap">
+            <div class="progress-bar">
+              <div
+                class="progress-bar-fill"
+                :class="{ 'is-error': importFailed }"
+                :style="{ width: progressPercent + '%' }"
+              ></div>
+            </div>
+            <div class="progress-bar-text">
+              {{ importFailed ? '已中断' : `${importActiveStep}/${importSteps.length}` }}
+            </div>
+          </div>
+
+          <!-- 步骤列表 -->
+          <ul class="step-list">
+            <li
+              v-for="(s, idx) in importSteps"
+              :key="idx"
+              :class="['step-item', `is-${s.status}`]"
+            >
+              <div class="step-indicator">
+                <el-icon v-if="s.status === 'finish'" class="step-icon finish"><CircleCheckFilled /></el-icon>
+                <el-icon v-else-if="s.status === 'error'" class="step-icon error"><CircleCloseFilled /></el-icon>
+                <el-icon v-else-if="s.status === 'process'" class="step-icon process is-loading"><Loading /></el-icon>
+                <span v-else class="step-num">{{ idx + 1 }}</span>
+              </div>
+              <div class="step-content">
+                <div class="step-title">{{ s.title }}</div>
+                <div class="step-description" :class="{ 'is-error': s.status === 'error' }">
+                  {{ s.description || '等待中...' }}
+                </div>
+              </div>
+            </li>
+          </ul>
+
+          <!-- 完成态：账号预览卡片 -->
+          <transition name="fade-up">
+            <div v-if="importDone && importResult" class="result-card">
+              <img
+                v-if="importResult.avatar"
+                :src="importResult.avatar"
+                class="result-avatar"
+                @error="importResult.avatar = ''"
+              />
+              <div v-else class="result-avatar-fallback">
+                {{ (importResult.userName || '?').charAt(0) }}
+              </div>
+              <div class="result-info">
+                <div class="result-name">{{ importResult.userName || '未识别昵称' }}</div>
+                <div class="result-meta">已成功导入为账号 #{{ importResult.accountId }}</div>
+              </div>
+            </div>
+          </transition>
+        </div>
+      </template>
+
+      <template #footer>
+        <template v-if="!importStarted">
+          <el-button @click="closeImportDialog" class="footer-btn">取消</el-button>
+          <el-button
+            type="primary"
+            :loading="importStarting"
+            :disabled="!importForm.platformId || !importForm.cookieStr.trim()"
+            class="footer-btn-primary"
+            @click="submitImport"
+          >
+            <el-icon v-if="!importStarting"><Position /></el-icon>
+            <span>开始导入</span>
+          </el-button>
+        </template>
+        <template v-else>
+          <el-button
+            :disabled="!importDone"
+            :type="importFailed ? 'danger' : 'primary'"
+            class="footer-btn-primary"
+            @click="closeImportDialog"
+          >
+            {{ importFailed ? '关闭' : (importDone ? '完成' : '处理中...') }}
+          </el-button>
+        </template>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
-import { Refresh, Loading, Link, Plus, Edit, Delete, Check, Folder, Key, CollectionTag, Close } from '@element-plus/icons-vue'
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick, h } from 'vue'
+import { Refresh, Loading, Link, Plus, Edit, Delete, Check, Folder, Key, CollectionTag, Close, Upload, SuccessFilled, CircleCheckFilled, CircleCloseFilled, Position, InfoFilled, Select, Search, Clock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
@@ -238,6 +490,7 @@ import { platformList, platformNameToId, platformNameToKey, platformCssMap, getP
 import { getDefaultAvatar, proxyAvatar } from '@/utils/avatar'
 import LoginDialog from '@/components/LoginDialog.vue'
 import TagPopover from '@/components/TagPopover.vue'
+import PrePublishCheckDialog from '@/components/PrePublishCheckDialog.vue'
 import BatchTagDialog from '@/components/BatchTagDialog.vue'
 
 const accountStore = useAccountStore()
@@ -298,6 +551,10 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   tagResizeObserver?.disconnect()
+  if (importEventSource) {
+    importEventSource.close()
+    importEventSource = null
+  }
 })
 
 async function onTagChanged() {
@@ -347,23 +604,32 @@ const fetchAccountsQuick = async () => {
   }
 }
 
+// 模板里用 ref 拿到 PrePublishCheckDialog 组件实例
+const prePublishCheckRef = ref(null)
+const prePublishCheckVisible = ref(false)
+
 const fetchAccounts = async () => {
   if (appStore.isAccountRefreshing) return
+  if (!accountStore.accounts.length) {
+    ElMessage.warning('暂无账号可检查')
+    return
+  }
   appStore.setAccountRefreshing(true)
+  // 复用发布前检查的 4 阶段进度弹窗（与发布流程交互一致）:
+  // 1) checking → 进度条 + 卡片实时状态
+  // 2) all-valid → 全部正常，1.2s 后自动关闭
+  // 3) fixing   → 失效账号自动打开 SSE 登录
+  // 4) done     → 全部修复完成，1.2s 后自动关闭
   try {
-    const res = await accountApi.getValidAccounts()
-    if (res.code === 200 && res.data) {
-      accountStore.setAccounts(res.data)
-      ElMessage.success('账号数据获取成功')
-      if (appStore.isFirstTimeAccountManagement) {
-        appStore.setAccountManagementVisited()
-      }
-    } else {
-      ElMessage.error('获取账号数据失败')
+    const allValid = await prePublishCheckRef.value.open(accountStore.accounts)
+    // dialog 内部已逐张更新 accountStore；这里再拉一次最新状态保证 UI 同步
+    await fetchAccountsQuick()
+    if (allValid && appStore.isFirstTimeAccountManagement) {
+      appStore.setAccountManagementVisited()
     }
   } catch (error) {
-    console.error('获取账号数据失败:', error)
-    ElMessage.error('获取账号数据失败')
+    console.error('批量检查失败:', error)
+    ElMessage.error('批量检查失败')
   } finally {
     appStore.setAccountRefreshing(false)
   }
@@ -452,6 +718,207 @@ const checkingIds = ref(new Set())
 const loginDialogVisible = ref(false)
 const loginMode = ref('add')        // 'add' | 'relogin'
 const reloginAccount = ref(null)
+
+// ── 导入用户（cookie 字符串）弹窗控制 ──────────────────────────
+const importDialogVisible = ref(false)
+const importSupportedPlatforms = ref([])  // [{id, key, name, letter}, ...]
+// 平台搜索关键词（导入弹窗左侧）
+const platformSearch = ref('')
+const filteredImportPlatforms = computed(() => {
+  const kw = platformSearch.value.trim().toLowerCase()
+  if (!kw) return importSupportedPlatforms.value
+  return importSupportedPlatforms.value.filter(p =>
+    p.name.toLowerCase().includes(kw) ||
+    (p.key || '').toLowerCase().includes(kw)
+  )
+})
+const importForm = reactive({
+  platformId: null,
+  cookieStr: '',
+})
+const importStarted = ref(false)
+const importStarting = ref(false)
+const importActiveStep = ref(0)   // 当前进行到的 step (0-based)
+const importDone = ref(false)      // 全部完成 / 失败时为 true，允许关闭
+const importFailed = ref(false)    // 失败态：进度条标红，关闭按钮变 danger
+const importResult = ref(null)     // { accountId, userName, avatar } 完成态展示
+// EventSource 是非响应式对象，用普通 let 持有；放在 ref 里会被 Vue proxy 包一层
+// 导致 close() 等行为不可靠。仿 LoginDialog.vue 的 eventSources Map 写法。
+let importEventSource = null
+
+// 顶部进度条百分比 (0/25/50/75/100)
+const progressPercent = computed(() => {
+  if (importFailed.value) return 100
+  const done = importSteps.value.filter(s => s.status === 'finish').length
+  return Math.round((done / importSteps.value.length) * 100)
+})
+
+// 当前正在导入的平台（用于头部 pill 展示）
+const currentImportPlatform = computed(() => {
+  if (!importForm.platformId) return null
+  return importSupportedPlatforms.value.find(p => p.id === importForm.platformId) || null
+})
+
+// 4 步进度，每项 { title, description, status: 'wait'|'process'|'finish'|'error' }
+const importSteps = ref([
+  { title: '解析 cookie 字符串', description: '等待中...', status: 'wait' },
+  { title: '生成 cookie 文件',   description: '等待中...', status: 'wait' },
+  { title: '同步用户资料',        description: '等待中...', status: 'wait' },
+  { title: '导入完成',            description: '等待中...', status: 'wait' },
+])
+
+const resetImportDialog = () => {
+  importStarted.value = false
+  importStarting.value = false
+  importActiveStep.value = 0
+  importDone.value = false
+  importFailed.value = false
+  importResult.value = null
+  importForm.platformId = null
+  importForm.cookieStr = ''
+  platformSearch.value = ''
+  importSteps.value = [
+    { title: '解析 cookie 字符串', description: '等待中...', status: 'wait' },
+    { title: '生成 cookie 文件',   description: '等待中...', status: 'wait' },
+    { title: '同步用户资料',        description: '等待中...', status: 'wait' },
+    { title: '导入完成',            description: '等待中...', status: 'wait' },
+  ]
+  if (importEventSource) {
+    importEventSource.close()
+    importEventSource = null
+  }
+}
+
+const handleImportAccount = async () => {
+  resetImportDialog()
+  importDialogVisible.value = true
+  try {
+    const res = await accountApi.getImportSupportedPlatforms()
+    if (res.code === 200 && res.data) {
+      importSupportedPlatforms.value = res.data
+    }
+  } catch (e) {
+    ElMessage.error('获取支持导入的平台列表失败')
+  }
+}
+
+const closeImportDialog = () => {
+  if (importEventSource) {
+    importEventSource.close()
+    importEventSource = null
+  }
+  importDialogVisible.value = false
+  // 给 el-dialog 关闭动画留 200ms 再清状态
+  setTimeout(() => resetImportDialog(), 200)
+}
+
+const submitImport = async () => {
+  if (!importForm.platformId || !importForm.cookieStr.trim()) {
+    ElMessage.warning('请选择平台并粘贴 cookie 字符串')
+    return
+  }
+  importStarting.value = true
+  importStarted.value = true
+
+  // 1. 启动任务
+  let taskId
+  try {
+    const res = await accountApi.startImportAccount({
+      type: importForm.platformId,
+      cookie_str: importForm.cookieStr.trim(),
+    })
+    if (res.code !== 200 || !res.data || !res.data.task_id) {
+      throw new Error(res.msg || '启动导入任务失败')
+    }
+    taskId = res.data.task_id
+  } catch (e) {
+    importStarting.value = false
+    importSteps.value[0].status = 'error'
+    importSteps.value[0].description = e.message || String(e)
+    importDone.value = true
+    importFailed.value = true
+    return
+  }
+  importStarting.value = false
+
+  // 2. SSE 监听进度
+  const es = new EventSource(`/importAccount/stream?task_id=${taskId}`)
+  importEventSource = es
+
+  es.onmessage = (event) => {
+    let payload
+    try {
+      payload = JSON.parse(event.data)
+    } catch (_) {
+      return
+    }
+    const step = Number(payload.step || 0)  // 1..4，error 时可能为 0
+
+    if (payload.status === 'error') {
+      // 标红当前 step（如果 step 缺失或越界，标红最后一个）
+      const idx = step >= 1 && step <= 4 ? step - 1 : Math.max(0, importActiveStep.value)
+      importSteps.value[idx].status = 'error'
+      importSteps.value[idx].description = payload.msg || '未知错误'
+      importDone.value = true
+      importFailed.value = true
+      es.close()
+      importEventSource = null
+      ElMessage.error(`导入失败: ${payload.msg || ''}`)
+      return
+    }
+
+    if (payload.status === 'done') {
+      importActiveStep.value = 4
+      for (let i = 0; i < 4; i++) {
+        importSteps.value[i].status = 'finish'
+        importSteps.value[i].description = importSteps.value[i].description || '完成'
+      }
+      importSteps.value[3].description = '已完成'
+      importResult.value = {
+        accountId: payload.account_id,
+        userName: payload.userName,
+        avatar: payload.avatar,
+      }
+      importDone.value = true
+      importFailed.value = false
+      es.close()
+      importEventSource = null
+      ElMessage.success('导入成功')
+      // 刷新账号列表
+      fetchAccountsQuick()
+      return
+    }
+
+    if (payload.status === 'running' && step >= 1 && step <= 4) {
+      const idx = step - 1
+      importActiveStep.value = idx
+      importSteps.value[idx].status = 'process'
+      importSteps.value[idx].description = payload.msg || '处理中...'
+      // 已完成的前置步骤保持 finish
+      for (let i = 0; i < idx; i++) {
+        if (importSteps.value[i].status === 'process') {
+          importSteps.value[i].status = 'finish'
+        }
+      }
+    }
+  }
+
+  es.onerror = () => {
+    // EventSource 出错时通常意味着后端已断开连接（task 已结束）。
+    // 如果 importDone 还没置 true，说明后端异常断开，标红最后活跃 step。
+    if (!importDone.value) {
+      const idx = importActiveStep.value
+      importSteps.value[idx].status = 'error'
+      importSteps.value[idx].description = '连接中断，请稍后重试'
+      importDone.value = true
+      ElMessage.error('导入连接中断')
+    }
+    es.close()
+    importEventSource = null
+  }
+}
+
+// ────────────────────────────────────────────────────────────
 
 const handleCheckAccount = async (row) => {
   checkingIds.value.add(row.id)
@@ -557,26 +1024,153 @@ const handleReLogin = (row) => {
 const syncingIds = reactive(new Set())
 
 const handleSyncProfile = async (row) => {
-  if (syncingIds.has(row.id)) return
-  syncingIds.add(row.id)
-  try {
-    const res = await accountApi.syncProfile(row.id)
-    if (res.code === 200 && res.data) {
-      accountStore.updateAccount(row.id, {
-        id: row.id,
-        name: res.data.name || row.name,
-        avatar: res.data.avatar || row.avatar
-      })
-      ElMessage.success('资料同步成功')
-    } else {
-      ElMessage.error(res.msg || '同步失败')
+    if (syncingIds.has(row.id)) return
+    syncingIds.add(row.id)
+    try {
+      const res = await accountApi.syncProfile(row.id)
+      if (res.code === 200 && res.data) {
+        // 新接口返回 {name, avatar, stats: [{ICON, COUNT, NAME, SORT}, ...]}
+        // 旧平台 stats 为 [] 时保留原值;新平台返回新数组时覆盖
+        const newStats = Array.isArray(res.data.stats) ? res.data.stats : null
+        accountStore.updateAccount(row.id, {
+          id: row.id,
+          name: res.data.name || row.name,
+          avatar: res.data.avatar || row.avatar,
+          stats: newStats !== null ? newStats : (row.stats || []),
+        })
+        ElMessage.success('资料同步成功')
+      } else {
+        ElMessage.error(res.msg || '同步失败')
+      }
+    } catch (error) {
+      console.error('同步资料失败:', error)
+      ElMessage.error('同步资料失败')
+    } finally {
+      syncingIds.delete(row.id)
     }
-  } catch (error) {
-    console.error('同步资料失败:', error)
-    ElMessage.error('同步资料失败')
-  } finally {
-    syncingIds.delete(row.id)
   }
+
+// 账号运营数据(粉丝/获赞/关注)是否需要展示:任一 > 0 才显示
+const hasStats = (account) => {
+  const f = Number(account.fans) || 0
+  const l = Number(account.likes) || 0
+  const fo = Number(account.follows) || 0
+  return f > 0 || l > 0 || fo > 0
+}
+
+// 数值格式化:10000 → 1.0w, 12345 → 1.2w, 100000000 → 1.0亿
+const formatStat = (value) => {
+  const n = Number(value) || 0
+  if (n < 1000) return String(n)
+  if (n < 10000) return (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + 'k'
+  if (n < 100000000) {
+    const v = n / 10000
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + 'w'
+  }
+  const v = n / 100000000
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + '亿'
+}
+
+// 账号 stats 排序:按 SORT 升序(SORT 缺失时排到最后)
+const sortStats = (stats) => {
+  if (!Array.isArray(stats)) return []
+  return [...stats].sort((a, b) => (Number(a?.SORT) || 999) - (Number(b?.SORT) || 999))
+}
+
+// 卡片显示的 stats:按 SORT 排序后取前 N 项(N 由平台决定)
+// 大多数平台 stats 总数 ≤ 4,正常展示;超过 4 项的平台只展示前 3 项(剩余进悬浮窗)
+// 注意 key 用 platform name(中文),与 store 解包后的 account.platform 一致
+const VISIBLE_COUNTS = {
+  'B站': 3,       // 8 项 stats:粉丝 + 点赞 + 收藏 + 更多占位
+  '百家号': 3,    // 6 项 stats:粉丝 + 播放量 + 搜索量 + 更多占位
+  '腾讯视频': 3,  // 8 项 stats:粉丝 + 总点赞 + 总评论 + 更多占位
+  '知乎': 3,      // 9 项 stats:粉丝 + 赞同 + 阅读 + 更多占位
+  'CSDN': 3,      // 4 项 stats:粉丝 + 总阅读 + 收藏 + 更多占位
+}
+const getVisibleCount = (account) => {
+  return VISIBLE_COUNTS[account?.platform] ?? 4
+}
+
+const getVisibleStats = (account) => {
+  return sortStats(account?.stats).slice(0, getVisibleCount(account))
+}
+
+// "更多"占位需要显示时,展示该账号的**全部** stats(不是剩余),
+// 鼠标悬停时能看到完整运营数据
+const getExtraStats = (account) => {
+  return sortStats(account?.stats)
+}
+
+// "更多"块 hover 时,动态调整浮窗水平位置,避免最右侧卡片溢出视口触发横向滚动条
+// 浮窗本身用 left:50% + transform:translateX(-50%) 居中,JS 在 hover 时根据
+// 浮窗实际位置算出溢出量,通过 --stats-popover-offset CSS 变量微调 translateX
+const handleStatsHover = (event) => {
+  const trigger = event.currentTarget
+  if (!trigger) return
+  const popover = trigger.querySelector('.stats-more-popover')
+  if (!popover) return
+
+  // 触发块的视口位置
+  const triggerRect = trigger.getBoundingClientRect()
+  // 浮窗的预期尺寸(先用临时显示拿真实尺寸,或者用默认 min-width 220)
+  const popoverWidth = popover.offsetWidth || 220
+  // 浮窗居中时左边缘 = 触发块中心 - 浮窗宽度/2
+  const centeredLeft = triggerRect.left + triggerRect.width / 2 - popoverWidth / 2
+  // 浮窗居中时右边缘
+  const centeredRight = centeredLeft + popoverWidth
+  // 视口宽度
+  const vw = window.innerWidth
+  // 安全边距(避免贴边)
+  const margin = 8
+
+  let offsetPx = 0
+  if (centeredRight > vw - margin) {
+    // 右边溢出 → 往左推
+    offsetPx = centeredRight - (vw - margin)
+  } else if (centeredLeft < margin) {
+    // 左边溢出 → 往右推
+    offsetPx = -(margin - centeredLeft)
+  }
+  trigger.style.setProperty('--stats-popover-offset', `${-offsetPx}px`)
+}
+
+// ICON 字符串 -> 渲染组件(SVG),通过 h() 创建组件实例(避免每个 ICON 写一个 .vue 文件)
+// SVG 风格保持与项目现有统计图标一致(Feather/Lucide 风格,14px stroke)
+const ICON_PATHS = {
+  user:   '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>',
+  like:   '<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>',
+  follow: '<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="23" y1="11" x2="17" y2="11"></line>',
+  play:   '<polygon points="5 3 19 12 5 21 5 3"></polygon>',
+  video:  '<polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>',
+  star:   '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>',
+  coin:   '<circle cx="12" cy="12" r="10"></circle><path d="M9.5 9a2.5 2.5 0 1 1 5 0c0 1.5-2.5 2-2.5 3.5"></path><line x1="12" y1="17" x2="12" y2="17.01"></line>',
+  chat:   '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>',
+  share:  '<circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>',
+  edit:   '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>',
+}
+
+// 缓存 h() 组件(避免每次 render 重新创建)
+const _iconCache = {}
+const getIconComponent = (iconKey) => {
+  const key = iconKey || 'user'
+  if (_iconCache[key]) return _iconCache[key]
+  const inner = ICON_PATHS[key] || ICON_PATHS.user
+  const comp = {
+    name: `StatIcon-${key}`,
+    render() {
+      return h('svg', {
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+        innerHTML: inner,
+      })
+    },
+  }
+  _iconCache[key] = comp
+  return comp
 }
 
 // getDefaultAvatar / proxyAvatar 已抽到 @/utils/avatar
@@ -653,13 +1247,19 @@ const submitAccountForm = () => {
       align-items: flex-start;
     }
 
+    .header-actions {
+      display: flex;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
     h1 {
       font-size: 28px;
       font-weight: 700;
       color: $text-primary;
       margin: 0;
       letter-spacing: -0.5px;
-      background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+      background: $gradient-brand;
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       background-clip: text;
@@ -684,6 +1284,21 @@ const submitAccountForm = () => {
       &:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px rgba($brand-start, 0.4);
+      }
+    }
+
+    /* 导入用户：次级按钮风格，不抢主按钮的视觉权重 */
+    .add-btn.import-btn {
+      background: rgba($overlay-rgb, 0.06);
+      border: 1px solid rgba($overlay-rgb, 0.18);
+      box-shadow: none;
+      color: $text-primary;
+
+      &:hover {
+        background: rgba($overlay-rgb, 0.12);
+        border-color: rgba($overlay-rgb, 0.3);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
       }
     }
   }
@@ -718,19 +1333,20 @@ const submitAccountForm = () => {
       &.active {
         background: rgba($brand-start, 0.15);
         border-color: $brand-start;
-        color: #fff;
+        color: $brand-start;
+        font-weight: 600;
         box-shadow: 0 0 20px rgba($brand-start, 0.2);
       }
 
       .tab-count {
-        background: rgba(255, 255, 255, 0.1);
+        background: rgba($overlay-rgb, 0.1);
         padding: 2px 8px;
         border-radius: 10px;
         font-size: 12px;
       }
 
       &.active .tab-count {
-        background: rgba(255, 255, 255, 0.2);
+        background: rgba($overlay-rgb, 0.2);
       }
     }
   }
@@ -799,7 +1415,7 @@ const submitAccountForm = () => {
       &.active {
         background: rgba($brand-start, 0.15);
         border-color: $brand-start;
-        color: #fff;
+        color: $brand-start;
       }
 
       .tag-dot {
@@ -841,7 +1457,8 @@ const submitAccountForm = () => {
     padding: 20px;
     transition: all $transition-base;
     position: relative;
-    overflow: hidden;
+    // 注意:不能用 overflow: hidden,否则账号卡片"更多"悬浮浮窗(绝对定位、向上超出
+    // 卡片边界)会被裁切。卡片内元素均在 padding 内,圆角由 border-radius 自然形成。
 
     &::before {
       content: '';
@@ -850,7 +1467,8 @@ const submitAccountForm = () => {
       left: 0;
       right: 0;
       height: 3px;
-      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+      background: linear-gradient(90deg, transparent, rgba($overlay-rgb, 0.1), transparent);
+      border-radius: 16px 16px 0 0;
       opacity: 0;
       transition: opacity $transition-base;
     }
@@ -985,6 +1603,241 @@ const submitAccountForm = () => {
       min-height: 22px;
     }
 
+    // 账号运营数据行(stats JSON):动态渲染统计块
+    .account-stats-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+      margin-bottom: 8px;
+      // 固定最小高度,让"已同步"(3 块 stat-block) 和"未同步"
+      // (1 块 stat-block-empty) 两种情况下卡片下半部分布局一致
+      min-height: 64px;
+
+      // 存量未同步数据的占位块(跨满整行,提示用户点同步)
+      .stat-block-empty {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 10px 12px;
+        border-radius: $radius-sm;
+        border: 1px dashed $border-light;
+        background: rgba($overlay-rgb, 0.03);
+        color: $text-muted;
+        font-size: 12px;
+
+        .empty-icon {
+          font-size: 14px;
+          opacity: 0.7;
+        }
+
+        .empty-text {
+          font-size: 12px;
+        }
+      }
+
+      .stat-block {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 7px 4px 6px;
+        border-radius: $radius-sm;
+        border: 1px solid transparent;
+        transition: all $transition-fast;
+        min-width: 0;
+        // 固定 stat-block 高度,与 .stat-block-empty 保持一致,
+        // 这样无论"已同步"还是"未同步"账号,卡片下半部分
+        // (stats-row + tags-row + actions-row) 高度都一致
+        min-height: 64px;
+
+        .stat-icon-wrap {
+          width: 22px;
+          height: 22px;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin-bottom: 3px;
+
+          svg {
+            width: 12px;
+            height: 12px;
+          }
+        }
+
+        .stat-value {
+          font-size: 16px;
+          font-weight: 700;
+          color: $text-primary;
+          font-variant-numeric: tabular-nums;
+          line-height: 1.15;
+          white-space: nowrap;
+        }
+
+        .stat-label {
+          font-size: 11px;
+          color: $text-muted;
+          margin-top: 1px;
+          max-width: 100%;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        // 按 ICON 字符串动态配色(stats JSON 里的 ICON 字段值)
+        &.stat-block-user {
+          background: rgba($brand-start, 0.15);
+          border-color: rgba($brand-start, 0.35);
+          .stat-icon-wrap { background: $brand-start; color: #fff; }
+        }
+        &.stat-block-like {
+          background: rgba($accent-rose, 0.15);
+          border-color: rgba($accent-rose, 0.35);
+          .stat-icon-wrap { background: $accent-rose; color: #fff; }
+        }
+        &.stat-block-follow {
+          background: rgba($accent-cyan, 0.15);
+          border-color: rgba($accent-cyan, 0.35);
+          .stat-icon-wrap { background: $accent-cyan; color: #fff; }
+        }
+        &.stat-block-play,
+        &.stat-block-video {
+          background: rgba($info-color, 0.15);
+          border-color: rgba($info-color, 0.35);
+          .stat-icon-wrap { background: $info-color; color: #fff; }
+        }
+        &.stat-block-star {
+          background: rgba($accent-amber, 0.15);
+          border-color: rgba($accent-amber, 0.35);
+          .stat-icon-wrap { background: $accent-amber; color: #fff; }
+        }
+        &.stat-block-coin {
+          background: rgba(#eab308, 0.18);
+          border-color: rgba(#eab308, 0.4);
+          .stat-icon-wrap { background: #eab308; color: #fff; }
+        }
+        &.stat-block-chat {
+          background: rgba($accent-green, 0.15);
+          border-color: rgba($accent-green, 0.35);
+          .stat-icon-wrap { background: $accent-green; color: #fff; }
+        }
+        &.stat-block-share {
+          background: rgba($accent-cyan, 0.12);
+          border-color: rgba($accent-cyan, 0.3);
+          .stat-icon-wrap { background: $accent-cyan; color: #fff; }
+        }
+
+        // 原创/编辑图标
+        &.stat-block-edit {
+          background: rgba($accent-amber, 0.15);
+          border-color: rgba($accent-amber, 0.35);
+          .stat-icon-wrap { background: $accent-amber; color: #fff; }
+        }
+
+        // "更多"块:中性灰(不抢眼)+ 作为悬浮浮窗的定位锚点
+        &.stat-block-more {
+          background: rgba($overlay-rgb, 0.05);
+          border-color: $border-light;
+          cursor: help;
+          position: relative;
+
+          .stat-icon-wrap {
+            background: rgba($overlay-rgb, 0.1);
+            color: $text-muted;
+          }
+
+          .stat-value {
+            color: $text-secondary;
+          }
+
+          // 原生 hover 浮窗:绝对定位在 more 块上方,卡片 DOM 内完全自控
+          .stats-more-popover {
+            // 默认隐藏
+            visibility: hidden;
+            opacity: 0;
+            transition: opacity 150ms ease, transform 150ms ease, visibility 150ms;
+
+            // 浮窗样式:品牌紫渐变背景,白色文字,跟卡片整体调性一致
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 50%;
+            // 水平方向:默认居中(translateX(-50%)),JS 在 hover 时根据视口边界
+            // 设置 --stats-popover-offset 变量微调,避免最右侧卡片溢出
+            transform: translateX(calc(-50% + var(--stats-popover-offset, 0px))) translateY(4px);
+            z-index: 100;
+
+            min-width: 220px;
+            padding: 10px 14px;
+            border-radius: $radius-base;
+            background: linear-gradient(135deg, rgba($brand-start, 0.95), rgba($brand-end, 0.92));
+            border: 1px solid rgba($brand-start, 0.6);
+            box-shadow: 0 6px 20px rgba($brand-start, 0.35), 0 2px 6px rgba(0, 0, 0, 0.15);
+
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px 18px;
+
+            // 鼠标悬停 more 块或浮窗自身时显示
+            pointer-events: none;
+          }
+
+          // hover 时显示浮窗
+          &:hover .stats-more-popover {
+            visibility: visible;
+            opacity: 1;
+            transform: translateX(calc(-50% + var(--stats-popover-offset, 0px))) translateY(0);
+            pointer-events: auto;
+          }
+
+          // 浮窗内的每一项
+          .stats-more-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            min-width: 0;
+
+            .name {
+              font-size: 12px;
+              color: rgba(255, 255, 255, 0.78);
+              font-weight: 500;
+            }
+
+            .value {
+              font-size: 13px;
+              font-weight: 700;
+              color: #fff;
+              font-variant-numeric: tabular-nums;
+            }
+          }
+        }
+
+        // 数据为 0 时:数字和图标淡化,背景保留彩色(避免变成"灰板")
+        &.is-empty {
+          .stat-icon-wrap {
+            opacity: 0.5;
+          }
+
+          .stat-value {
+            color: $text-muted;
+            font-weight: 600;
+          }
+        }
+
+        &:hover {
+          transform: translateY(-1px);
+          border-color: $border-active;
+        }
+      }
+    }
+
+    // 悬浮窗内的"更多数据"网格 —— 移到全局 <style> 块定义(el-tooltip 内容渲染到 body,
+    // scoped CSS 里的 :deep() 编译后仍带外层选择器前缀,无法匹配 popper DOM)
+    // 见 <style lang="scss"> 块末尾的全局 .account-stats-tooltip 样式
+
     .account-tags-label {
       font-size: 12px;
       color: $text-muted;
@@ -1083,7 +1936,7 @@ const submitAccountForm = () => {
       width: 18px;
       height: 18px;
       flex: 0 0 auto;
-      border: 1px dashed rgba(255,255,255,0.2);
+      border: 1px dashed rgba($overlay-rgb, 0.2);
       border-radius: 4px;
       background: transparent;
       color: $text-muted;
@@ -1108,11 +1961,13 @@ const submitAccountForm = () => {
         display: flex;
         align-items: center;
         gap: 6px;
+        width: 100%;
       }
 
       .action-btn {
         display: inline-flex;
         align-items: center;
+        justify-content: center;
         gap: 4px;
         padding: 6px 8px;
         border: none;
@@ -1121,10 +1976,11 @@ const submitAccountForm = () => {
         font-weight: 500;
         cursor: pointer;
         transition: all $transition-base;
-        background: rgba(255, 255, 255, 0.05);
+        background: rgba($overlay-rgb, 0.05);
         color: $text-secondary;
         white-space: nowrap;
-        flex-shrink: 0;
+        flex: 1 1 0;
+        min-width: 0;
 
         .el-icon {
           font-size: 14px;
@@ -1214,5 +2070,499 @@ const submitAccountForm = () => {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
+}
+
+/* ── 导入用户弹窗 ─────────────────────────────────────── */
+.import-account-dialog {
+  /* 紧凑化 dialog body / header / footer 间距 */
+  :deep(.el-dialog__header) {
+    padding: 14px 18px 10px;
+    margin-right: 0;
+  }
+  :deep(.el-dialog__body) {
+    padding: 14px 18px;
+  }
+  :deep(.el-dialog__footer) {
+    padding: 10px 18px 14px;
+  }
+
+  .import-dialog-header {
+    padding: 0;
+    .import-dialog-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      color: $text-primary;
+      .title-icon {
+        font-size: 18px;
+        color: $brand-start;
+      }
+    }
+    .import-dialog-sub {
+      margin-top: 4px;
+      font-size: 12px;
+      color: $text-muted;
+    }
+  }
+
+  .import-form-split {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 16px;
+    min-height: 260px;
+
+    .split-left,
+    .split-right {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    /* 让左侧搜索框固定，列表区独立滚动 */
+    .split-left {
+      .platform-search {
+        margin-bottom: 8px;
+        flex-shrink: 0;
+      }
+      .platform-search :deep(.el-input__wrapper) {
+        background: $bg-base;
+        box-shadow: 0 0 0 1px rgba($overlay-rgb, 0.1) inset;
+        border-radius: 8px;
+        padding: 4px 12px;
+        &:hover, &.is-focus {
+          box-shadow: 0 0 0 1px rgba($brand-start, 0.5) inset;
+        }
+      }
+      .platform-search :deep(.el-input__inner) {
+        height: 36px;
+        color: $text-primary;
+        &::placeholder { color: rgba($overlay-rgb, 0.3); }
+      }
+
+      .platform-list {
+        flex: 1;
+        min-height: 0;
+      }
+    }
+
+    .split-section-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 8px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: $text-primary;
+      flex-shrink: 0;
+
+      .dot {
+        color: $brand-start;
+        font-size: 8px;
+      }
+    }
+
+    /* 左侧：扁平卡片列表（参考 LoginDialog.platform-card 风格） */
+    .platform-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow-y: auto;
+      max-height: 360px;
+      padding-right: 4px;
+
+      /* 自定义滚动条 */
+      &::-webkit-scrollbar { width: 6px; }
+      &::-webkit-scrollbar-track { background: transparent; }
+      &::-webkit-scrollbar-thumb {
+        background: rgba($overlay-rgb, 0.12);
+        border-radius: 999px;
+        &:hover { background: rgba($overlay-rgb, 0.2); }
+      }
+    }
+
+    .platform-card-flat {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 7px 10px;
+      background: $bg-surface;
+      border: 1px solid $border;
+      border-radius: $radius-sm;
+      cursor: pointer;
+      transition: all $transition-fast;
+      position: relative;
+
+      .card-logo-wrap {
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+
+        .card-logo {
+          width: 20px;
+          height: 20px;
+          border-radius: 4px;
+          object-fit: contain;
+        }
+        .card-letter {
+          font-size: 13px;
+          font-weight: 700;
+        }
+      }
+
+      .card-text {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+
+        .card-name {
+          font-size: 13px;
+          font-weight: 500;
+          color: $text-primary;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          line-height: 1.3;
+        }
+        .card-meta {
+          font-size: 11px;
+          color: $text-muted;
+        }
+      }
+
+      .card-check {
+        font-size: 15px;
+        color: $brand-start;
+      }
+
+      &:hover {
+        background: rgba($brand-start, 0.06);
+        border-color: $border-active;
+      }
+
+      &.is-selected {
+        background: rgba($brand-start, 0.08);
+        border-color: $brand-start;
+
+        .card-meta {
+          color: $brand-start;
+        }
+      }
+    }
+
+    .empty-platform {
+      padding: 30px 12px;
+      text-align: center;
+      font-size: 12px;
+      color: $text-muted;
+    }
+
+    /* 右侧：cookie 输入 */
+    .import-textarea {
+      flex: 1;
+    }
+    .import-textarea :deep(textarea) {
+      font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 12.5px;
+      line-height: 1.6;
+      padding: 12px;
+      background: $bg-base;
+      border: 1px solid rgba($overlay-rgb, 0.1);
+      border-radius: 8px;
+      color: $text-primary;
+      transition: all $transition-base;
+      height: 100%;
+      min-height: 220px;
+
+      &:focus {
+        background: $bg-base;
+        border-color: $brand-start;
+        box-shadow: 0 0 0 2px rgba($brand-start, 0.15);
+      }
+      &::placeholder {
+        color: rgba($overlay-rgb, 0.25);
+      }
+    }
+
+    .cookie-tip {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 7px 9px;
+      background: rgba($brand-start, 0.05);
+      border: 1px solid rgba($brand-start, 0.15);
+      border-radius: 6px;
+      font-size: 11px;
+      color: $text-muted;
+      line-height: 1.5;
+
+      .el-icon {
+        color: $brand-start;
+        flex-shrink: 0;
+        margin-top: 1px;
+      }
+    }
+  }
+
+  /* ── 进度阶段 ─────────────────────────────────────── */
+  .import-progress {
+    .import-progress-header {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 16px;
+
+      .platform-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 14px 6px 6px;
+        background: rgba($overlay-rgb, 0.04);
+        border: 1px solid rgba($overlay-rgb, 0.08);
+        border-radius: 999px;
+        font-size: 13px;
+
+        .platform-letter {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 26px;
+          height: 26px;
+          border-radius: 50%;
+          color: #fff;
+          font-weight: 600;
+          font-size: 13px;
+        }
+        .platform-name {
+          color: $text-primary;
+          font-weight: 500;
+        }
+      }
+    }
+
+    .progress-bar-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+
+      .progress-bar {
+        flex: 1;
+        height: 6px;
+        background: rgba($overlay-rgb, 0.06);
+        border-radius: 999px;
+        overflow: hidden;
+        position: relative;
+
+        .progress-bar-fill {
+          height: 100%;
+          background: linear-gradient(90deg, #{$brand-start} 0%, #{$brand-end} 100%);
+          border-radius: 999px;
+          transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+
+          &.is-error {
+            background: linear-gradient(90deg, #ef4444 0%, #f87171 100%);
+          }
+        }
+      }
+      .progress-bar-text {
+        font-size: 12px;
+        color: $text-muted;
+        font-variant-numeric: tabular-nums;
+        min-width: 36px;
+        text-align: right;
+      }
+    }
+
+    .step-list {
+      list-style: none;
+      padding: 0;
+      margin: 0 0 16px;
+
+      .step-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 14px;
+        padding: 12px 0;
+        position: relative;
+        transition: opacity 0.3s;
+
+        /* 步骤之间虚线连接 */
+        &:not(:last-child)::after {
+          content: '';
+          position: absolute;
+          left: 17px;
+          top: 44px;
+          bottom: -4px;
+          width: 1px;
+          background: rgba($overlay-rgb, 0.08);
+        }
+
+        .step-indicator {
+          flex-shrink: 0;
+          width: 34px;
+          height: 34px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 50%;
+          background: rgba($overlay-rgb, 0.04);
+          border: 1px solid rgba($overlay-rgb, 0.1);
+          color: $text-muted;
+          font-size: 14px;
+          font-weight: 600;
+          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+
+          .step-icon {
+            font-size: 22px;
+            &.finish { color: #22c55e; }
+            &.error { color: #ef4444; }
+            &.process { color: $brand-start; }
+          }
+        }
+
+        .step-content {
+          flex: 1;
+          min-width: 0;
+          padding-top: 4px;
+
+          .step-title {
+            font-size: 14px;
+            font-weight: 500;
+            color: $text-primary;
+            margin-bottom: 2px;
+            transition: color 0.3s;
+          }
+          .step-description {
+            font-size: 12px;
+            color: $text-muted;
+            line-height: 1.5;
+            word-break: break-all;
+
+            &.is-error {
+              color: #fca5a5;
+            }
+          }
+        }
+
+        /* wait 状态：整体淡 */
+        &.is-wait {
+          opacity: 0.45;
+        }
+
+        /* process 状态：指示器脉动 */
+        &.is-process .step-indicator {
+          background: rgba($brand-start, 0.12);
+          border-color: rgba($brand-start, 0.4);
+          box-shadow: 0 0 0 4px rgba($brand-start, 0.08);
+        }
+
+        /* finish 状态 */
+        &.is-finish .step-indicator {
+          background: rgba($success-color, 0.12);
+          border-color: rgba($success-color, 0.4);
+        }
+
+        /* error 状态 */
+        &.is-error .step-indicator {
+          background: rgba($danger-color, 0.12);
+          border-color: rgba($danger-color, 0.4);
+        }
+      }
+    }
+
+    /* ── 完成态：账号预览卡片 ───────────────────────── */
+    .result-card {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px;
+      margin-top: 4px;
+      background: linear-gradient(135deg,
+        rgba($brand-start, 0.08) 0%,
+        rgba($brand-end, 0.04) 100%);
+      border: 1px solid rgba($brand-start, 0.25);
+      border-radius: 12px;
+
+      .result-avatar,
+      .result-avatar-fallback {
+        flex-shrink: 0;
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        object-fit: cover;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      }
+      .result-avatar-fallback {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, $brand-start, $brand-end);
+        color: #fff;
+        font-size: 20px;
+        font-weight: 600;
+      }
+      .result-info {
+        flex: 1;
+        min-width: 0;
+        .result-name {
+          font-size: 15px;
+          font-weight: 600;
+          color: $text-primary;
+          margin-bottom: 2px;
+        }
+        .result-meta {
+          font-size: 12px;
+          color: $text-muted;
+        }
+      }
+    }
+  }
+
+  /* footer 按钮 */
+  .footer-btn {
+    background: rgba($overlay-rgb, 0.06);
+    border: 1px solid rgba($overlay-rgb, 0.12);
+    color: $text-primary;
+    &:hover {
+      background: rgba($overlay-rgb, 0.12);
+      border-color: rgba($overlay-rgb, 0.2);
+    }
+  }
+  .footer-btn-primary {
+    min-width: 110px;
+    background: linear-gradient(135deg, $brand-start, $brand-end);
+    border: none;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    &:hover {
+      opacity: 0.92;
+      transform: translateY(-1px);
+    }
+  }
+}
+
+/* 完成态卡片上滑动画 */
+.fade-up-enter-active,
+.fade-up-leave-active {
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.fade-up-enter-from {
+  opacity: 0;
+  transform: translateY(12px);
+}
+.fade-up-leave-to {
+  opacity: 0;
+  transform: translateY(-12px);
 }
 </style>

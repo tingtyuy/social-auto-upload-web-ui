@@ -10,13 +10,14 @@ from queue import Queue
 
 from conf import BASE_DIR
 
-from .._browser import create_browser_sync, create_context_sync
+from .._browser import close_browser, create_browser_sync, create_context_sync
 from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
-    scrape_user_profile,
-    save_login_result,
     parse_schedule_time,
+    raise_if_page_closed,
+    save_login_result,
+    scrape_user_profile,
 )
 
 from util._logger import bind_account_name, get_channel_logger
@@ -70,6 +71,24 @@ class XiaohongshuPlatform(BasePlatform):
     platform_key = "xiaohongshu"
     platform_name = "小红书"
 
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    platform_cookie_domain = ".xiaohongshu.com"
+
+    def _parse_cookie_to_storage_state(self, cookie_str):
+        cookies = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair: continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(), "value": value.strip(),
+                "domain": self.platform_cookie_domain, "path": "/",
+                "expires": expires, "httpOnly": True, "secure": False, "sameSite": "Lax",
+            })
+        return cookies, []
+
     # ------------------------------------------------------------------
     # login()
     # ------------------------------------------------------------------
@@ -119,6 +138,11 @@ class XiaohongshuPlatform(BasePlatform):
                 await url_changed_event.wait()
                 logger.info("[xhs] login page navigation detected")
 
+                # 扫码成功后小红书常在 登录页↔首页 间再跳一两次（会话同步），
+                # 等 URL 稳定落在创作中心（非登录页）再抓资料，避免在中间态操作
+                await self._wait_login_settled(page)
+                logger.info("[xhs] 登录后页面已稳定: %s", page.url)
+
                 # Login succeeded -- scrape profile, save cookie, write DB
                 await save_login_result(
                     context, page,
@@ -126,6 +150,9 @@ class XiaohongshuPlatform(BasePlatform):
                     platform_name=self.platform_name,
                     status_queue=status_queue,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(关注数/粉丝数/获赞与收藏),
+                    # 与 sync_profile 共用同一份抓取逻辑
+                    stats_fn=self._login_stats_fn,
                 )
                 success = True
             finally:
@@ -176,8 +203,14 @@ class XiaohongshuPlatform(BasePlatform):
     # sync_profile()
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Xiaohongshu creator centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """Sync profile info (name, avatar, stats) from Xiaohongshu creator centre.
+
+        抓取 creator.xiaohongshu.com/new/home 个人卡片上的三个数值:
+        - 关注数 (DOM: `.numerical` + 标签文本"关注数")
+        - 粉丝数 (DOM: `.numerical` + 标签文本"粉丝数")
+        - 获赞与收藏 (DOM: `.numerical` + 标签文本"获赞与收藏")
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         url = _XHS_CREATOR_URL
 
@@ -186,16 +219,53 @@ class XiaohongshuPlatform(BasePlatform):
             context = await self.create_context(browser, storage_state=cookie_path)
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
+                # 同 _login_stats_fn：networkidle 在小红书几乎达不到，白等 30s 超时
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 name, avatar = await scrape_user_profile(page)
-                return name, avatar
+                stats = await _scrape_xhs_stats(page)
+                return {"name": name, "avatar": avatar, "stats": stats}
             except Exception as e:
                 logger.info(f"[xhs] sync profile failed: {e}")
-                return "", ""
+                return {"name": "", "avatar": "", "stats": []}
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+    async def _wait_login_settled(self, page, timeout_s: int = 30) -> None:
+        """等扫码后的重定向跳完：URL 离开登录页且连续两次采样一致才返回。
+
+        超时不抛异常，按当前状态继续（后续 scrape 有各自的判空兜底）。
+        """
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        last_url = ""
+        stable = 0
+        while asyncio.get_event_loop().time() < deadline:
+            url = page.url or ""
+            if _XHS_LOGIN_URL not in url and url == last_url:
+                stable += 1
+                if stable >= 2:
+                    return
+            else:
+                stable = 0
+            last_url = url
+            await asyncio.sleep(1)
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用 _scrape_xhs_stats 抓取逻辑,
+        保证"登录后同步"和"同步按钮"看到的运营数据完全一致。
+        """
+        try:
+            # 此时页面已稳定在创作中心首页（login 里 _wait_login_settled 等过），
+            # 不要再 goto：强制跳 creator 根路径会触发「首页→登录页→首页」的
+            # 二次重定向，用户会看到登录成功后又闪一次登录页。直接在当前页抓，
+            # .numerical 渲染由 _scrape_xhs_stats 内部 wait_for_selector 兜底。
+            return await _scrape_xhs_stats(page)
+        except Exception as exc:
+            logger.info(f"[xhs login] _login_stats_fn 抓取失败: {exc}")
+            return []
 
     # ------------------------------------------------------------------
     # open_creator_center()
@@ -576,7 +646,7 @@ async def _publish_single_video(
                     pass
             await context.close()
     finally:
-        await browser.close()
+        await close_browser(browser, is_close_by_code=True)
 
 
 async def _publish_single_image(
@@ -609,7 +679,11 @@ async def _publish_single_image(
 
             # Navigate to image publish page
             logger.info("[上传图集] 正在打开图集发布页面...")
-            await page.goto(_XHS_PUBLISH_IMAGE_URL, wait_until="networkidle")
+            # 注意: 不用 wait_until="networkidle" —— 小红书 creator 页存在持续后台
+            # 请求(心跳/统计), 极难达到 networkidle, 30s 默认超时易触发 goto 超时。
+            # 后续 wait_for_selector 上传区域才是真正的就绪信号(与视频发布侧一致)。
+            await page.goto(_XHS_PUBLISH_IMAGE_URL)
+            await page.wait_for_url(_XHS_PUBLISH_IMAGE_URL)
             await asyncio.sleep(3)  # 等待页面完全加载
             logger.info("[上传图集] 图集发布页面已打开")
 
@@ -691,7 +765,7 @@ async def _publish_single_image(
         logger.error("[发布图集] 图集发布浏览器错误: %s", e)
         return False
     finally:
-        await browser.close()
+        await close_browser(browser, is_close_by_code=True)
 
 
 # ======================================================================
@@ -773,6 +847,7 @@ async def _upload_video_content(
     await cdp.send("DOM.enable")
     try:
         while True:
+            raise_if_page_closed(page)
             try:
                 uploading_count = await page.locator(
                     'div.uploading:has-text("上传中")'
@@ -1009,15 +1084,30 @@ async def _fill_tags(page, tags: list) -> None:
     if await desc_el.count() and await desc_el.is_visible():
         await desc_el.click()
 
+    # 小红书话题联想下拉 (tippy 浮层):
+    #   <div id="creator-editor-topic-container" class="items">
+    #     <div class="item is-selected">#三亚</div>
+    #     <div class="item">#三亚的阳光</div>
+    #     ...
+    #   </div>
+    # 流程:输入 #xxx → 小红书自己弹出下拉 → 用户按 Space 选中默认项 #xxx → 下拉立刻关闭。
+    # 所以等待下拉出现必须在 Space 之前:Space 一按,下拉就被销毁,放 Space 之后 wait_for
+    # 永远超时(实测每个标签间隔 8s 全 timeout,见 2026-07-21 18:31 日志)。
+    tag_dropdown_item = page.locator(
+        'div#creator-editor-topic-container div.item'
+    ).first
     for tag in tags:
         # 输入 # 标签
         await page.keyboard.type("#" + tag, delay=30)
-        # 等待一下让输入完成
-        await asyncio.sleep(0.5)
-        # 按空格触发标签识别
+        # 一直等到话题联想下拉数据出来再按 Space,网络慢时旧 sleep(0.5) 不够
+        try:
+            await tag_dropdown_item.wait_for(state="visible", timeout=8000)
+        except Exception as exc:
+            logger.info("[填写标签] 话题下拉未出现 (#%s): %s", tag, exc)
+        # 按空格触发标签识别(选中默认项 #xxx,下拉会立即销毁)
         await page.keyboard.press("Space")
-        # 等待标签被识别
-        await asyncio.sleep(1)
+        # 给 React 一点时间消化 Space,把 #xxx 渲染成话题芯片,避免下一标签粘连
+        await asyncio.sleep(0.3)
 
 
 async def _set_thumbnail(page, thumbnail_path: str) -> None:
@@ -1536,3 +1626,78 @@ async def _set_original_declaration(page) -> None:
 
     except Exception as exc:
         logger.info("[原创声明] 原创声明设置失败 (非致命): %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# 小红书运营数据抓取(stats)
+# ---------------------------------------------------------------------------
+
+async def _scrape_xhs_stats(page) -> list:
+    """抓取小红书创作者中心首页用户卡片的三个统计数。
+
+    页面 DOM 结构(参见用户提供的 2026-07-19 抓取样本):
+        <div class="static description-text" style="display:flex; gap:12px;">
+          <div style="display:flex; gap:4px; align-items:center;">
+            <span class="numerical">0</span>
+            <span>关注数</span>
+          </div>
+          <div style="display:flex; gap:4px; align-items:center;">
+            <span class="numerical">0</span>
+            <span>粉丝数</span>
+          </div>
+          <div style="display:flex; gap:4px; align-items:center;">
+            <span class="numerical">7</span>
+            <span>获赞与收藏</span>
+          </div>
+        </div>
+
+    Returns:
+        list[dict]: 按 SORT 排序的运营数据列表
+    """
+    stats = []
+
+    # 映射表:label text -> (ICON, SORT, 中文 NAME)
+    label_map = {
+        "关注数":     ("follow", 1, "关注数"),
+        "粉丝数":     ("user",   2, "粉丝数"),
+        "获赞与收藏": ("like",   3, "获赞与收藏"),
+    }
+
+    try:
+        # 等待数值渲染(最多 8 秒,登录态下通常 <2s)
+        await page.wait_for_selector(".numerical", timeout=8000)
+    except Exception:
+        logger.info("[xhs stats] 等待 .numerical 超时")
+
+    try:
+        # 用 evaluate 一次性拿所有 (数值, 标签) 对
+        raw = await page.evaluate(
+            '''() => {
+                const items = [];
+                document.querySelectorAll('.description-text > div').forEach(div => {
+                    const numEl = div.querySelector('.numerical');
+                    const txtEl = div.querySelectorAll('span');
+                    if (!numEl) return;
+                    // 标签在数值之后的第二个 span
+                    const labelSpan = div.querySelector('span:not(.numerical)');
+                    const label = labelSpan ? labelSpan.textContent.trim() : '';
+                    const num = numEl.textContent.trim();
+                    if (label) items.push({label, num});
+                });
+                return items;
+            }'''
+        )
+        for item in raw:
+            label = item.get('label', '')
+            if label in label_map:
+                icon, sort_no, name = label_map[label]
+                try:
+                    count = int(str(item.get('num', '0')).replace(',', '').replace(' ', '') or '0')
+                except (ValueError, TypeError):
+                    count = 0
+                stats.append({"ICON": icon, "COUNT": count, "NAME": name, "SORT": sort_no})
+    except Exception as exc:
+        logger.info(f"[xhs stats] 抓取失败: {exc}")
+
+    stats.sort(key=lambda x: x.get("SORT", 999))
+    return stats

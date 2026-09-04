@@ -53,8 +53,8 @@
           v-for="mat in items"
           :key="mat.id"
           class="msd-card"
-          :class="{ selected: selectedId === mat.id }"
-          @click="selectedId = mat.id"
+          :class="{ selected: isSelected(mat.id) }"
+          @click="onCardClick(mat)"
         >
           <!-- Preview -->
           <div class="msd-card-preview">
@@ -118,7 +118,7 @@
             </template>
 
             <!-- Selected check -->
-            <div v-if="selectedId === mat.id" class="msd-card-check">
+            <div v-if="isSelected(mat.id)" class="msd-card-check">
               <el-icon :size="14"><Check /></el-icon>
             </div>
 
@@ -128,9 +128,8 @@
               {{ mat.storage_type === 's3' ? 'S3' : '本地' }}
             </span>
 
-            <!-- Hover overlay -->
+            <!-- Hover overlay：仅显示日期（大小已常驻在 caption） -->
             <div class="msd-card-hover-info">
-              <span class="msd-card-size">{{ formatSize(mat.file_size) }}</span>
               <span class="msd-card-date">{{ formatDate(mat.upload_time) }}</span>
             </div>
           </div>
@@ -138,6 +137,13 @@
           <div class="msd-card-caption">
             <span class="msd-card-name" :title="mat.original_filename">
               {{ mat.original_filename }}
+            </span>
+            <span class="msd-card-meta">
+              <span v-if="mat.file_size">{{ formatSize(mat.file_size) }}</span>
+              <span v-if="mat.duration && mat.file_type === 'video'" class="msd-card-meta-dur">
+                {{ Math.round(mat.duration) }}s
+              </span>
+              <span v-if="mat.upload_time" class="msd-card-meta-date">{{ formatDate(mat.upload_time) }}</span>
             </span>
           </div>
         </div>
@@ -174,7 +180,11 @@
     <template #footer>
       <div class="msd-footer">
         <div class="msd-footer-status">
-          <span v-if="selectedMat" class="msd-footer-selected">
+          <span v-if="multiple" class="msd-footer-selected">
+            <el-icon :size="14" color="var(--brand-start, #5b8cff)"><Check /></el-icon>
+            <span>已选：{{ selectedMats.length }} 个素材（可跨页选择）</span>
+          </span>
+          <span v-else-if="selectedMat" class="msd-footer-selected">
             <el-icon :size="14" color="var(--brand-start, #5b8cff)"><Check /></el-icon>
             <span>已选：{{ selectedMat.original_filename }}</span>
           </span>
@@ -182,8 +192,13 @@
         </div>
         <div class="msd-footer-actions">
           <el-button @click="visible = false">取消</el-button>
-          <el-button type="primary" :disabled="!selectedId" :loading="probing" @click="confirmSelect">
-            确定
+          <el-button
+            type="primary"
+            :disabled="multiple ? selectedMats.length === 0 : !selectedId"
+            :loading="probing"
+            @click="confirmSelect"
+          >
+            确定{{ multiple && selectedMats.length > 0 ? `（${selectedMats.length} 个）` : '' }}
           </el-button>
         </div>
       </div>
@@ -227,8 +242,25 @@ const pageSize = ref(24)
 const searchKeyword = ref('')
 const typeFilter = ref('all')
 const selectedId = ref(null)
+// 多选模式：保存完整素材对象（跨页保留，确认时一次性 emit）
+const selectedMats = ref([])
 // 当前正在播放的视频素材 id（互斥，同一时间只能播一个）
 const playingId = ref(null)
+
+function isSelected(id) {
+  if (props.multiple) return selectedMats.value.some((m) => m.id === id)
+  return selectedId.value === id
+}
+
+function onCardClick(mat) {
+  if (props.multiple) {
+    const idx = selectedMats.value.findIndex((m) => m.id === mat.id)
+    if (idx >= 0) selectedMats.value.splice(idx, 1)
+    else selectedMats.value.push(mat)
+  } else {
+    selectedId.value = mat.id
+  }
+}
 
 // 当 props.filterType 限定为 video/image 时，只显示对应按钮，不允许切换类型
 const typeOptions = computed(() => {
@@ -334,7 +366,8 @@ async function loadPage() {
       items.value = resp.data.items || []
       total.value = resp.data.total || 0
       // 翻页后，如果当前选中/正在播放的素材不在新页面则清空
-      if (selectedId.value && !items.value.some((m) => m.id === selectedId.value)) {
+      // （多选模式跨页保留已选项，不清空）
+      if (!props.multiple && selectedId.value && !items.value.some((m) => m.id === selectedId.value)) {
         selectedId.value = null
       }
       if (playingId.value && !items.value.some((m) => m.id === playingId.value)) {
@@ -350,16 +383,11 @@ async function loadPage() {
   }
 }
 
-async function confirmSelect() {
-  if (!selectedId.value) return
-  const material = items.value.find((m) => m.id === selectedId.value)
-  if (!material) return
-
-  // 视频且元数据缺失（duration=0）时,同步调用 /probe 补全元数据,
-  // 这样调用方在 publishAll 校验时拿到的 videoData 已含 duration
+// 视频且元数据缺失（duration=0）时,调用 /probe 补全元数据,
+// 这样调用方在发布校验时拿到的素材已含 duration
+async function probeIfMissing(material) {
   if (material.file_type === 'video' && (!material.duration || material.duration === 0)) {
     try {
-      probing.value = true
       const res = await materialsApi.probe(material.id)
       if (res?.code === 200 && res.data) {
         // 用后端返回的最新数据更新 material
@@ -371,12 +399,12 @@ async function confirmSelect() {
     } catch (err) {
       console.warn('[MaterialSelectDialog] probe failed:', err)
       // probe 失败也允许继续选,前端校验会兜底
-    } finally {
-      probing.value = false
     }
   }
+}
 
-  emit('select', {
+function toPayload(material) {
+  return {
     id: material.id,
     name: material.original_filename,
     url: getFileUrl(material.stored_path),
@@ -384,7 +412,38 @@ async function confirmSelect() {
     size: material.file_size,
     type: material.mime_type,
     duration: material.duration ?? 0,
-  })
+  }
+}
+
+async function confirmSelect() {
+  if (props.multiple) {
+    if (selectedMats.value.length === 0) return
+    probing.value = true
+    try {
+      // 串行探测元数据，避免并发 probe 压垮后端
+      for (const mat of selectedMats.value) {
+        await probeIfMissing(mat)
+      }
+    } finally {
+      probing.value = false
+    }
+    emit('select', selectedMats.value.map(toPayload))
+    visible.value = false
+    return
+  }
+
+  if (!selectedId.value) return
+  const material = items.value.find((m) => m.id === selectedId.value)
+  if (!material) return
+
+  probing.value = true
+  try {
+    await probeIfMissing(material)
+  } finally {
+    probing.value = false
+  }
+
+  emit('select', toPayload(material))
   visible.value = false
 }
 
@@ -393,6 +452,7 @@ function onClosed() {
   typeFilter.value = props.filterType || 'all'
   page.value = 1
   selectedId.value = null
+  selectedMats.value = []
   playingId.value = null
   items.value = []
   total.value = 0
@@ -403,6 +463,7 @@ async function open() {
   typeFilter.value = props.filterType || 'all'
   page.value = 1
   selectedId.value = null
+  selectedMats.value = []
   await loadPage()
 }
 
@@ -410,10 +471,11 @@ defineExpose({ open })
 </script>
 
 <style lang="scss">
+@use '@/styles/variables.scss' as *;
 .material-select-dialog {
   --msd-radius: 14px;
-  --msd-glass: rgba(20, 22, 28, 0.85);
-  --msd-border: rgba(255, 255, 255, 0.08);
+  --msd-glass: rgba($bg-elevated-rgb, 0.85);
+  --msd-border: rgba($overlay-rgb, 0.08);
   --msd-brand-1: #5b8cff;
   --msd-brand-2: #8b5cff;
 
@@ -425,8 +487,8 @@ defineExpose({ open })
     border-radius: var(--msd-radius);
     box-shadow:
       0 25px 60px rgba(0, 0, 0, 0.5),
-      0 0 0 1px rgba(255, 255, 255, 0.03),
-      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      0 0 0 1px rgba($overlay-rgb, 0.03),
+      inset 0 1px 0 rgba($overlay-rgb, 0.04);
     overflow: hidden;
   }
 
@@ -443,29 +505,29 @@ defineExpose({ open })
   .el-dialog__footer {
     padding: 14px 20px;
     border-top: 1px solid var(--msd-border);
-    background: rgba(0, 0, 0, 0.2);
+    background: $bg-base;
   }
 }
 </style>
 
 <style scoped lang="scss">
+@use '@/styles/variables.scss' as *;
 $brand-1: #5b8cff;
 $brand-2: #8b5cff;
-$text-1: #e5e7eb;
-$text-2: #9ca3af;
-$text-3: #6b7280;
-$border: rgba(255, 255, 255, 0.08);
-$bg-card: rgba(255, 255, 255, 0.03);
-$bg-card-hover: rgba(255, 255, 255, 0.05);
+$text-1: $text-primary;
+$text-2: $text-secondary;
+$text-3: $text-muted;
+$border: rgba($overlay-rgb, 0.08);
+$bg-card: rgba($overlay-rgb, 0.03);
+$bg-card-hover: rgba($overlay-rgb, 0.05);
 
 // ===== Header =====
 .msd-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 22px;
+  padding: 16px 20px;
   border-bottom: 1px solid $border;
-  // 标题区无独立背景，融入弹窗整体深色玻璃
 }
 
 .msd-header-title {
@@ -502,32 +564,36 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   color: $brand-1;
 }
 
-// ===== Toolbar =====
+// ===== Toolbar（独立容器，搜索 + 分段控件） =====
 .msd-toolbar {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 16px 22px 12px;
+  padding: 8px;
+  margin: 12px 16px 0;
+  background: $overlay-hover;
+  border: 1px solid $border;
+  border-radius: 12px;
 }
 
 .msd-search {
   flex: 1;
-  max-width: 360px;
+  max-width: 320px;
 
   :deep(.el-input__wrapper) {
-    background: rgba(0, 0, 0, 0.25);
-    border: 1px solid $border;
-    border-radius: 10px;
+    background: $bg-elevated;
+    border: 1px solid transparent;
+    border-radius: 20px;
     box-shadow: none;
-    padding: 4px 12px;
+    padding: 6px 14px;
     transition: all 0.2s ease;
-    &:hover { border-color: rgba(255, 255, 255, 0.16); }
+    &:hover { border-color: rgba($overlay-rgb, 0.16); }
     &.is-focus {
       border-color: rgba($brand-1, 0.5);
       box-shadow: 0 0 0 3px rgba($brand-1, 0.12);
-      background: rgba(0, 0, 0, 0.35);
     }
     .el-input__inner {
+      height: 28px;
       color: $text-1;
       &::placeholder { color: $text-3; }
     }
@@ -535,11 +601,12 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   }
 }
 
+// 类型筛选：分段控件（segmented control）风格
 .msd-type-filter {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   padding: 3px;
-  background: rgba(0, 0, 0, 0.25);
+  background: $bg-elevated;
   border: 1px solid $border;
   border-radius: 10px;
 }
@@ -570,26 +637,26 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
 
 // ===== Body =====
 .msd-body {
-  padding: 8px 22px 4px;
+  padding: 12px 16px 4px;
   min-height: 320px;
   max-height: 52vh;
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+  scrollbar-color: rgba($overlay-rgb, 0.08) transparent;
 
   &::-webkit-scrollbar { width: 6px; }
   &::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba($overlay-rgb, 0.1);
     border-radius: 3px;
-    &:hover { background: rgba(255, 255, 255, 0.18); }
+    &:hover { background: rgba($overlay-rgb, 0.18); }
   }
 }
 
 // ===== Grid =====
 .msd-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 10px;
   padding: 4px 0 12px;
 }
 
@@ -631,8 +698,8 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   aspect-ratio: 1;
   overflow: hidden;
   background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.02), rgba(0, 0, 0, 0.1)),
-    repeating-linear-gradient(45deg, transparent, transparent 8px, rgba(255,255,255,0.01) 8px, rgba(255,255,255,0.01) 16px);
+    linear-gradient(135deg, rgba($overlay-rgb, 0.02), rgba($overlay-rgb, 0.06)),
+    repeating-linear-gradient(45deg, transparent, transparent 8px, rgba($overlay-rgb, 0.01) 8px, rgba($overlay-rgb, 0.01) 16px);
 
   img {
     width: 100%;
@@ -655,7 +722,7 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   justify-content: center;
   background:
     radial-gradient(circle at center, rgba($brand-1, 0.1), transparent 70%),
-    rgba(0, 0, 0, 0.2);
+    $bg-base;
   color: $text-2;
 }
 
@@ -685,7 +752,7 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   padding: 2px 7px;
   background: rgba(0, 0, 0, 0.7);
   backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  border: 1px solid rgba($overlay-rgb, 0.15);
   border-radius: 4px;
   color: #d1d5db;
   font-size: 11px;
@@ -695,8 +762,8 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
 
   &.s3 {
     color: #fff;
-    background: rgba(37, 99, 235, 0.7);
-    border-color: rgba(96, 165, 250, 0.5);
+    background: rgba($info-color, 0.7);
+    border-color: rgba($info-color, 0.5);
   }
 }
 
@@ -756,7 +823,7 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   z-index: 2;
 
   &:hover {
-    background: rgba(220, 38, 38, 0.85);
+    background: rgba($danger-color, 0.85);
     transform: scale(1.08);
   }
 }
@@ -775,7 +842,7 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
   justify-content: center;
   box-shadow:
     0 2px 8px rgba($brand-1, 0.5),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    inset 0 1px 0 rgba($overlay-rgb, 0.2);
   animation: msd-check-pop 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
@@ -802,18 +869,39 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
 }
 
 .msd-card-caption {
-  padding: 7px 8px 9px;
+  padding: 6px 8px 8px;
 }
 
 .msd-card-name {
   display: block;
-  font-size: 11px;
+  font-size: 12px;
   color: $text-1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-weight: 500;
+  font-weight: 600;
   transition: color 0.15s ease;
+}
+
+// 常驻的元信息行：大小 / 时长 / 日期
+.msd-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 10px;
+  color: $text-3;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  white-space: nowrap;
+
+  .msd-card-meta-dur { color: $brand-1; }
+  .msd-card-meta-date {
+    margin-left: auto;
+    opacity: 0.8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 
 // ===== Empty =====
@@ -848,22 +936,22 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
 .msd-pagination {
   display: flex;
   justify-content: center;
-  padding: 8px 0 12px;
+  padding: 10px 16px;
   border-top: 1px solid $border;
-  margin-top: 4px;
-  background: rgba(0, 0, 0, 0.1);
+  margin: 4px 0 0;
 
   :deep(.el-pagination) {
     --el-pagination-bg-color: transparent;
-    --el-pagination-button-bg-color: rgba(255, 255, 255, 0.04);
+    --el-pagination-button-bg-color: rgba($overlay-rgb, 0.04);
     --el-pagination-hover-color: #{$brand-1};
     --el-pagination-button-color: #{$text-2};
     --el-pagination-button-disabled-bg-color: transparent;
 
     .btn-prev, .btn-next, .el-pager li {
-      background: rgba(255, 255, 255, 0.04) !important;
+      background: rgba($overlay-rgb, 0.04) !important;
       color: $text-2 !important;
       border: 1px solid transparent;
+      border-radius: 6px;
 
       &:hover {
         color: $brand-1 !important;
@@ -878,7 +966,7 @@ $bg-card-hover: rgba(255, 255, 255, 0.05);
     }
 
     .el-pagination__sizes .el-select .el-select__wrapper {
-      background: rgba(255, 255, 255, 0.04);
+      background: rgba($overlay-rgb, 0.04);
       box-shadow: 0 0 0 1px $border;
     }
   }

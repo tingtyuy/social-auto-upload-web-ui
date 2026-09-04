@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     :model-value="modelValue"
-    title="发布前账号检查"
+    :title="title"
     width="640px"
     :close-on-click-modal="false"
     @update:model-value="onVisibleChange"
@@ -56,14 +56,14 @@
       <!-- 全部正常 -->
       <div v-if="phase === 'all-valid'" class="all-valid-section">
         <el-icon class="all-valid-icon"><CircleCheckFilled /></el-icon>
-        <span>所有账号状态正常，即将开始发布...</span>
+        <span>{{ allValidText }}</span>
       </div>
 
       <!-- 失效账号修复列表 -->
       <div v-if="phase === 'fixing'" class="fix-section">
         <p class="fix-hint">
           <el-icon color="#f56c6c"><WarningFilled /></el-icon>
-          检测到 <strong>{{ invalidCards.length }}</strong> 个账号 Cookie 失效，请逐个重新登录后再发布
+          检测到 <strong>{{ invalidCards.length }}</strong> 个账号 Cookie 失效，请点击「重新登录」逐个修复
         </p>
         <div class="invalid-grid">
           <div
@@ -113,7 +113,7 @@
       <!-- 全部修复完成 -->
       <div v-if="phase === 'done'" class="all-valid-section">
         <el-icon class="all-valid-icon"><CircleCheckFilled /></el-icon>
-        <span>所有账号已修复，即将开始发布...</span>
+        <span>{{ doneText }}</span>
       </div>
     </div>
 
@@ -122,7 +122,7 @@
         v-if="phase === 'fixing'"
         @click="onCancel"
       >
-        取消发布
+        {{ cancelButtonText }}
       </el-button>
     </template>
   </el-dialog>
@@ -140,8 +140,30 @@ import { useAccountStore } from '@/stores/account'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
+  // 用途模式：'pre-publish'（发布前检查） / 'account-check'（账号管理批量检查）
+  // 影响 dialog 标题、全通过/完成/取消等文案，其余交互逻辑完全一致
+  mode: { type: String, default: 'pre-publish' },
 })
+
 const emit = defineEmits(['update:modelValue', 'all-valid'])
+
+// 文案随模式切换 — 复用同一套 4 阶段交互，仅提示语不同
+const title = computed(() =>
+  props.mode === 'account-check' ? '批量检查账号状态' : '发布前账号检查'
+)
+const allValidText = computed(() =>
+  props.mode === 'account-check'
+    ? '所有账号状态正常'
+    : '所有账号状态正常，即将开始发布...'
+)
+const doneText = computed(() =>
+  props.mode === 'account-check'
+    ? '所有失效账号已修复'
+    : '所有账号已修复，即将开始发布...'
+)
+const cancelButtonText = computed(() =>
+  props.mode === 'account-check' ? '关闭' : '取消发布'
+)
 
 // ===== 状态 =====
 // phase: 'checking' → 'all-valid' | 'fixing' → 'done'
@@ -173,7 +195,7 @@ function open(accounts) {
       logo: p?.logo || null,
       letter: p?.letter || '?',
       color: p?.color || '#999',
-      bgColor: p?.bgColor || 'rgba(255,255,255,0.06)',
+      bgColor: p?.bgColor || 'var(--surface-hover)',
       cssClass: p?.cssClass || '',
       checkStatus: 'pending',  // pending / checked
       valid: false,
@@ -196,13 +218,17 @@ function platformTypeToKey(type) {
   const map = {
     1: 'xiaohongshu', 2: 'channels', 3: 'douyin', 4: 'kuaishou',
     5: 'bilibili', 6: 'baijiahao', 7: 'tiktok', 8: 'youtube',
-    9: 'tencent_video', 10: 'iqiyi', 11: 'weibo', 12: 'alipay', 13: 'toutiao', 14: 'zhihu',
+    9: 'tencent_video', 10: 'iqiyi', 11: 'weibo', 12: 'alipay', 13: 'toutiao', 14: 'zhihu', 15: 'csdn', 16: 'vivo', 17: 'weixin_gzh',
+    18: 'taobao_guanghe', 19: 'jingmai',
   }
   return map[type] || ''
 }
 
-// ===== 并发检查（限流 4）=====
-const CONCURRENCY = 4
+// ===== 并发检查（限流 2）=====
+// 原来是 4，会同时拉起 4 个 headless 浏览器 + 占满后端默认 4 线程，
+// 一旦检测到失效进入 fixing，SSE login 请求挤不进线程池 → 后端假死。
+// 降到 2 更稳妥（后端已同时把线程池加大到 16）。
+const CONCURRENCY = 2
 
 async function runConcurrentChecks() {
   const queue = [...cards.value]
@@ -241,10 +267,10 @@ async function runConcurrentChecks() {
       resolvePromise = null
     }, 1200)
   } else {
-    // 有失效，进入修复阶段 —— 自动触发登录(不再等用户点“重新登录”)
+    // 有失效，进入修复阶段 —— 不自动发起，等用户在失效列表里
+    // 逐个点「重新登录」按钮（模板 fixStatus==='idle' 分支）。
+    // 原来是 forEach 并发发起，会一次弹 N 个浏览器窗口 + 挤死后端线程池。
     phase.value = 'fixing'
-    // 所有失效账号同时打开登录浏览器(并发),用户在各自浏览器窗口扫码
-    invalidCards.value.forEach(c => { startRelogin(c) })
   }
 }
 
@@ -401,9 +427,9 @@ defineExpose({ open })
   }
 
   &.is-invalid {
-    border-color: rgba(245, 108, 108, 0.3);
+    border-color: rgba($danger-color, 0.3);
     border-left: 3px solid #f56c6c;
-    background: rgba(245, 108, 108, 0.04);
+    background: rgba($danger-color, 0.04);
   }
 }
 
@@ -492,8 +518,8 @@ defineExpose({ open })
   align-items: center;
   gap: 12px;
   padding: 12px 14px;
-  background: rgba(245, 108, 108, 0.06);
-  border: 1px solid rgba(245, 108, 108, 0.2);
+  background: rgba($danger-color, 0.06);
+  border: 1px solid rgba($danger-color, 0.2);
   border-left: 3px solid #f56c6c;
   border-radius: $radius-sm;
   transition: all 0.2s;
@@ -511,7 +537,7 @@ defineExpose({ open })
   }
 
   &.is-fail {
-    border-color: rgba(245, 108, 108, 0.3);
+    border-color: rgba($danger-color, 0.3);
   }
 }
 
@@ -599,24 +625,24 @@ defineExpose({ open })
   }
 
   &.action-cancel {
-    background: rgba(255, 255, 255, 0.04);
+    background: rgba($overlay-rgb, 0.04);
     border-color: $border;
     color: $text-muted;
 
     &:hover {
-      background: rgba(245, 108, 108, 0.1);
-      border-color: rgba(245, 108, 108, 0.3);
+      background: rgba($danger-color, 0.1);
+      border-color: rgba($danger-color, 0.3);
       color: #f56c6c;
     }
   }
 
   &.action-retry {
-    background: rgba(245, 108, 108, 0.08);
-    border-color: rgba(245, 108, 108, 0.3);
+    background: rgba($danger-color, 0.08);
+    border-color: rgba($danger-color, 0.3);
     color: #f56c6c;
 
     &:hover {
-      background: rgba(245, 108, 108, 0.16);
+      background: rgba($danger-color, 0.16);
     }
   }
 }

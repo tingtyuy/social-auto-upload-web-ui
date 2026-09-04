@@ -3,6 +3,7 @@
 import asyncio
 import os
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -11,6 +12,7 @@ from conf import BASE_DIR
 from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
+    raise_if_page_closed,
     save_login_result,
     scrape_weibo_profile,
 )
@@ -46,6 +48,24 @@ class WeiboPlatform(BasePlatform):
     platform_id = 11
     platform_key = "weibo"
     platform_name = "微博"
+
+    # 支持 cookie 字符串导入账号
+    supports_cookie_import = True
+    platform_cookie_domain = ".weibo.com"
+
+    def _parse_cookie_to_storage_state(self, cookie_str):
+        cookies = []
+        expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair: continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(), "value": value.strip(),
+                "domain": self.platform_cookie_domain, "path": "/",
+                "expires": expires, "httpOnly": True, "secure": False, "sameSite": "Lax",
+            })
+        return cookies, []
 
     # ------------------------------------------------------------------
     # login()
@@ -110,6 +130,9 @@ class WeiboPlatform(BasePlatform):
                     status_queue=status_queue,
                     scrape_fn=scrape_weibo_profile,
                     account_id=account_id,
+                    # 登录成功后在同一个 session 内补抓 stats(粉丝/关注/转评赞),
+                    # 与 sync_profile 共用同一份抓取逻辑
+                    stats_fn=self._login_stats_fn,
                 )
                 success = True
             finally:
@@ -191,25 +214,152 @@ class WeiboPlatform(BasePlatform):
     # sync_profile()
     # ------------------------------------------------------------------
 
-    async def sync_profile(self, cookie_file: str) -> tuple:
-        """Sync profile info (name, avatar) from Weibo creator centre."""
+    async def sync_profile(self, cookie_file: str) -> dict:
+        """同步微博昵称、头像、运营数据(stats)。
+
+        抓取流程:
+        1. 访问 weibo.com 首页,点击右上角头像 → 跳转到个人主页 weibo.com/u/<id>
+        2. 在个人主页抓 name/avatar/stats(粉丝/关注/转评赞)
+
+        与 login 路径(使用 scrape_weibo_profile)独立,stats 不在原 scraper 里,
+        这里新实现抓取。从个人主页一个 DOM 一次抓全 3 项 stats + 昵称头像。
+        """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
-        url = _WEIBO_CREATOR_URL
 
         browser = await self.create_browser(headless=True)
         try:
             context = await self.create_context(browser, storage_state=cookie_path)
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-                return await scrape_weibo_profile(page)
+                # 1. 访问微博首页
+                await page.goto("https://weibo.com/", wait_until="domcontentloaded", timeout=20000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+                # 2. 点击右上角用户头像 → 跳转到个人主页
+                try:
+                    avatar_btn = page.locator('.woo-badge-box img').first
+                    await avatar_btn.wait_for(state="visible", timeout=8000)
+                    await avatar_btn.click()
+                    # 等跳转到 /u/<id>
+                    await page.wait_for_url("**/u/**", timeout=10000)
+                except Exception as exc:
+                    logger.info(f"[weibo] 点击头像跳转个人主页失败: {exc}")
+
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+                # 3. 抓 name/avatar/stats(都在同一个 ._h3_/._h4_ 区块附近)
+                result = await page.evaluate(
+                    '''() => {
+                        const out = {name: '', avatar: '', stats: []};
+                        // 头像:.woo-avatar-img
+                        const av = document.querySelector('.woo-avatar-img');
+                        if (av) out.avatar = av.getAttribute('src') || '';
+                        // 昵称:._name_1yc79_291(后端 hash 改了,用 [class*="_name_"] 兜底)
+                        const nameEl = document.querySelector('[class*="_name_"]');
+                        if (nameEl) out.name = (nameEl.textContent || '').trim();
+                        // stats:3 个 _h5_ span,分别是 粉丝 / 关注 / 转评赞
+                        document.querySelectorAll('[class*="_h5_"]').forEach(el => {
+                            const numEl = el.querySelector('span');
+                            const text = (el.textContent || '').trim();
+                            if (!numEl) return;
+                            const num = (numEl.textContent || '').trim();
+                            // label 在 num 之后的文本里(例如 "2粉丝" 或 "粉丝 2")
+                            // 简单规则:含"粉丝"→粉丝;含"关注"→关注;含"转评赞"→转评赞
+                            if (text.includes('粉丝')) {
+                                out.stats.push({name: '粉丝', num});
+                            } else if (text.includes('转评赞')) {
+                                out.stats.push({name: '转评赞', num});
+                            } else if (text.includes('关注')) {
+                                out.stats.push({name: '关注', num});
+                            }
+                        });
+                        return out;
+                    }'''
+                )
+                name = (result or {}).get('name', '')
+                avatar = (result or {}).get('avatar', '')
+                stats_raw = (result or {}).get('stats', [])
+
+                # 组装 stats JSON
+                stats = []
+                label_map = {
+                    "粉丝":   ("user",   1, "粉丝"),
+                    "关注":   ("follow", 2, "关注"),
+                    "转评赞": ("like",   3, "转评赞"),
+                }
+                for item in stats_raw:
+                    label = item.get('name', '')
+                    num = item.get('num', '0')
+                    if label in label_map:
+                        icon, sort_no, std_name = label_map[label]
+                        try:
+                            count = int(str(num).replace(',', '').replace(' ', '') or '0')
+                        except (ValueError, TypeError):
+                            count = 0
+                        stats.append({"ICON": icon, "COUNT": count, "NAME": std_name, "SORT": sort_no})
+
+                if not name and not avatar and not stats:
+                    logger.info(f"[weibo] sync_profile 抓取为空,url={page.url}")
+
+                return {"name": name, "avatar": avatar, "stats": stats}
             except Exception as e:
                 logger.info(f"[weibo] sync profile failed: {e}")
-                return "", ""
+                return {"name": "", "avatar": "", "stats": []}
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+    async def _login_stats_fn(self, page, account_id) -> list:
+        """登录成功后的 stats 抓取入口(供 save_login_result 调用)。
+
+        与 sync_profile 内部共用同一套 js evaluate 抓取逻辑。
+        """
+        try:
+            await asyncio.sleep(1)
+            result = await page.evaluate(
+                '''() => {
+                    const out = [];
+                    document.querySelectorAll('[class*="_h5_"]').forEach(el => {
+                        const numEl = el.querySelector('span');
+                        const text = (el.textContent || '').trim();
+                        if (!numEl) return;
+                        const num = (numEl.textContent || '').trim();
+                        if (text.includes('粉丝')) out.push({name:'粉丝', num});
+                        else if (text.includes('转评赞')) out.push({name:'转评赞', num});
+                        else if (text.includes('关注')) out.push({name:'关注', num});
+                    });
+                    return out;
+                }'''
+            )
+            label_map = {
+                "粉丝":   ("user",   1, "粉丝"),
+                "关注":   ("follow", 2, "关注"),
+                "转评赞": ("like",   3, "转评赞"),
+            }
+            stats = []
+            for item in (result or []):
+                label = item.get('name', '')
+                num = item.get('num', '0')
+                if label in label_map:
+                    icon, sort_no, std_name = label_map[label]
+                    try:
+                        count = int(str(num).replace(',', '').replace(' ', '') or '0')
+                    except (ValueError, TypeError):
+                        count = 0
+                    stats.append({"ICON": icon, "COUNT": count, "NAME": std_name, "SORT": sort_no})
+            return stats
+        except Exception as exc:
+            logger.info(f"[weibo login] _login_stats_fn 抓取失败: {exc}")
+            return [] 
 
     # ------------------------------------------------------------------
     # publish_video -- full Weibo upload pipeline (sync entry point)
@@ -278,6 +428,9 @@ class WeiboPlatform(BasePlatform):
         tags = kwargs.get("tags", []) or []
         desc = kwargs.get("desc", "") or ""
         ai_content = kwargs.get("ai_content", "") or ""
+        content_statement = kwargs.get("content_statement", "") or ""
+        content_statement2 = kwargs.get("content_statement2", "") or ""
+        content_statement2_optional = kwargs.get("content_statement2_optional", "") or ""
         # 忽略字段(微博图集不支持)
         # is_original / enableTimer / schedule_time_str / cover_path
         _ = kwargs.get("is_original")  # noqa
@@ -317,6 +470,9 @@ class WeiboPlatform(BasePlatform):
                     account_file=cookie_path,
                     desc=desc,
                     ai_content=ai_content,
+                    content_statement=content_statement,
+                    content_statement2=content_statement2,
+                    content_statement2_optional=content_statement2_optional,
                 )
 
         logger.info("=" * 60)
@@ -335,6 +491,9 @@ class WeiboPlatform(BasePlatform):
         account_file: str,
         desc: str = "",
         ai_content: str = "",
+        content_statement: str = "",
+        content_statement2: str = "",
+        content_statement2_optional: str = "",
     ):
         """Upload one image album to one Weibo account.
 
@@ -385,9 +544,17 @@ class WeiboPlatform(BasePlatform):
                 logger.info("[填写简介] 开始填写微博正文...")
                 await self._set_description(page, desc, title, tags)
 
-                # 3. 内容声明 (复用 video 版)
-                logger.info("[内容声明] 开始设置内容声明: %s", ai_content or "无")
-                await self._set_content_statement(page, ai_content)
+                # 3. 内容声明 (复用 video 版,自动探测版本1/版本2 UI)
+                # 版本1:优先用 content_statement(前端下拉),为空时回退到
+                # ai_content(兼容旧图集流程把类型声明当内容声明用的历史行为)
+                v1_stmt = content_statement or ai_content
+                logger.info(
+                    "[内容声明] 开始设置内容声明: 版本1=%s, 版本2必选=%s, 版本2可选=%s",
+                    v1_stmt or "无", content_statement2 or "无", content_statement2_optional or "无",
+                )
+                await self._set_content_statement(
+                    page, v1_stmt, content_statement2, content_statement2_optional
+                )
 
                 # 4. 发送
                 logger.info("[发布] 正在点击发送按钮...")
@@ -404,7 +571,7 @@ class WeiboPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: upload image files via hidden input[type=file]
@@ -547,6 +714,7 @@ class WeiboPlatform(BasePlatform):
         send_btn = page.get_by_role("button", name="发送", exact=True).first
         deadline = asyncio.get_event_loop().time() + 300  # 5 分钟
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             try:
                 disabled = await send_btn.get_attribute("disabled")
                 if disabled is None:
@@ -607,6 +775,7 @@ class WeiboPlatform(BasePlatform):
         send_btn = page.get_by_role("button", name="发送", exact=True).first
 
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             try:
                 # 条件 1: textarea 清空
                 textarea_empty = await textarea.input_value() == ""
@@ -646,10 +815,15 @@ class WeiboPlatform(BasePlatform):
         account_file = kwargs.get("account_file", []) or []
         thumbnail_landscape_path = kwargs.get("thumbnail_landscape_path")
         thumbnail_portrait_path = kwargs.get("thumbnail_portrait_path")
+        # 16:9 / 9:16 封面(微博封面框实际比例,优先于 4:3 / 3:4 使用)
+        thumbnail_landscape_169_path = kwargs.get("thumbnail_landscape_169_path")
+        thumbnail_portrait_916_path = kwargs.get("thumbnail_portrait_916_path")
         desc = kwargs.get("desc", "") or ""
         category = kwargs.get("category")
         ai_content = kwargs.get("ai_content", "") or ""
         content_statement = kwargs.get("content_statement", "") or ""
+        content_statement2 = kwargs.get("content_statement2", "") or ""
+        content_statement2_optional = kwargs.get("content_statement2_optional", "") or ""
         weibo_collection = kwargs.get("weibo_collection", "") or ""
 
         # 打印发布参数摘要
@@ -690,10 +864,14 @@ class WeiboPlatform(BasePlatform):
                         account_file=cookie_path,
                         thumbnail_landscape_path=thumbnail_landscape_path,
                         thumbnail_portrait_path=thumbnail_portrait_path,
+                        thumbnail_landscape_169_path=thumbnail_landscape_169_path,
+                        thumbnail_portrait_916_path=thumbnail_portrait_916_path,
                         desc=desc,
                         category=category,
                         ai_content=ai_content,
                         content_statement=content_statement,
+                        content_statement2=content_statement2,
+                        content_statement2_optional=content_statement2_optional,
                         weibo_collection=weibo_collection,
                     )
 
@@ -713,10 +891,14 @@ class WeiboPlatform(BasePlatform):
         account_file: str,
         thumbnail_landscape_path=None,
         thumbnail_portrait_path=None,
+        thumbnail_landscape_169_path=None,
+        thumbnail_portrait_916_path=None,
         desc="",
         category=None,
         ai_content="",
         content_statement="",
+        content_statement2="",
+        content_statement2_optional="",
         weibo_collection="",
     ):
         """Upload a single video to one Weibo account."""
@@ -800,6 +982,8 @@ class WeiboPlatform(BasePlatform):
                     page,
                     thumbnail_landscape_path,
                     thumbnail_portrait_path,
+                    thumbnail_landscape_169_path,
+                    thumbnail_portrait_916_path,
                 )
                 logger.info("[设置封面] 封面设置完成")
 
@@ -818,9 +1002,14 @@ class WeiboPlatform(BasePlatform):
                 logger.info("[填写简介] 开始填写微博正文...")
                 await self._set_description(page, desc, title, tags)
 
-                # 内容声明(可选)
-                logger.info("[内容声明] 开始设置内容声明: %s", content_statement or "无")
-                await self._set_content_statement(page, content_statement)
+                # 内容声明(可选):自动探测版本1弹窗 / 版本2必选+可选下拉
+                logger.info(
+                    "[内容声明] 开始设置内容声明: 版本1=%s, 版本2必选=%s, 版本2可选=%s",
+                    content_statement or "无", content_statement2 or "无", content_statement2_optional or "无",
+                )
+                await self._set_content_statement(
+                    page, content_statement, content_statement2, content_statement2_optional
+                )
 
                 # 点发布
                 logger.info("[发布] 正在点击发布按钮...")
@@ -837,7 +1026,7 @@ class WeiboPlatform(BasePlatform):
             finally:
                 await context.close()
         finally:
-            await browser.close()
+            await self.close_browser(browser, is_close_by_code=True)
 
     # ------------------------------------------------------------------
     # Helper: upload the video file via hidden input[type=file]
@@ -973,6 +1162,7 @@ class WeiboPlatform(BasePlatform):
         deadline = asyncio.get_event_loop().time() + 30
         found_input = None
         while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
             try:
                 count = await page.locator(marked_sel).count()
                 if count > 0:
@@ -1047,6 +1237,11 @@ class WeiboPlatform(BasePlatform):
         deadline = asyncio.get_event_loop().time() + timeout_s
 
         while asyncio.get_event_loop().time() < deadline:
+            # 0. 浏览器/页面被用户关闭 → 立即判发布失败。
+            #    下方 except Exception: pass 会把关闭后的所有 Playwright 异常
+            #    吞掉空转,任务在队列里卡「发布中」直到 4 小时超时。
+            raise_if_page_closed(page)
+
             # 1. 「上传中」DOM 消失 或 发布按钮可见(文字已从「自动发布」变成「发布」)
             try:
                 uploading_gone = await uploading_locator.count() == 0
@@ -1306,6 +1501,8 @@ class WeiboPlatform(BasePlatform):
         page,
         thumbnail_landscape_path=None,
         thumbnail_portrait_path=None,
+        thumbnail_landscape_169_path=None,
+        thumbnail_portrait_916_path=None,
     ):
         """上传封面。
 
@@ -1317,11 +1514,15 @@ class WeiboPlatform(BasePlatform):
         4. 等待「编辑封面」弹层出现
         5. 找到弹层内的隐藏 ``input[type=file]`` 上传图片
         6. 点击「完成」按钮
+
+        封面尺寸优先级:微博封面框实际是 16:9 / 9:16,优先用
+        ``thumbnail_landscape_169_path``(16:9) / ``thumbnail_portrait_916_path``
+        (9:16);没有时回退到 4:3 / 3:4。
         """
         cover_path = await WeiboPlatform._pick_cover_by_aspect(
             page,
-            landscape_path=thumbnail_landscape_path,
-            portrait_path=thumbnail_portrait_path,
+            landscape_path=thumbnail_landscape_169_path or thumbnail_landscape_path,
+            portrait_path=thumbnail_portrait_916_path or thumbnail_portrait_path,
         )
         if not cover_path or not os.path.exists(cover_path):
             logger.info("[发布] 无封面文件,跳过封面上传")
@@ -1591,7 +1792,7 @@ class WeiboPlatform(BasePlatform):
     async def _set_description(page, desc: str, title: str, tags: list):
         """填充微博正文 textarea。
 
-        若 desc 为空,回落到 title;tags 拼成 #话题 形式追加。
+        描述为空时不再回落标题，保持为空；tags 拼成 #话题 形式追加。
         """
         # textarea placeholder: 有什么新鲜事想分享给大家?
         textarea = page.locator(
@@ -1599,7 +1800,7 @@ class WeiboPlatform(BasePlatform):
         ).first
         await textarea.wait_for(state="visible", timeout=10000)
 
-        text = (desc or title or "").strip()
+        text = (desc or "").strip()
         if tags:
             tag_str = " ".join(f"#{t}" for t in tags)
             text = f"{text} {tag_str}".strip() if text else tag_str
@@ -1619,8 +1820,69 @@ class WeiboPlatform(BasePlatform):
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _set_content_statement(page, statement: str):
-        """选择底部工具栏的「内容声明」。
+    async def _set_content_statement(page, v1_stmt: str = "", v2_required: str = "", v2_optional: str = ""):
+        """选择发布页的「内容声明」。
+
+        微博有两种内容声明 UI,对不同账号/场景展示其中一种,运行时自动探测:
+
+        版本1(老):底部工具栏「内容声明」文本触发弹窗,5 选项单选
+            (无/内容为自主创作/内容为转载/内容由AI生成/内容为虚构演绎)。
+        版本2(新):「请进行内容声明（必填）」触发下拉,分「必选」6 项 +
+            「可选」4 项两组,选完点「确定」。
+
+        前端用 3 个独立下拉分别承载两套声明,后端探测到哪种 UI 就用对应那套值:
+        - 版本1 UI → 用 v1_stmt
+        - 版本2 UI → 用 v2_required(必选) + v2_optional(可选)
+
+        Args:
+            v1_stmt: 版本1 声明值(5 选 1,或「无」/空=不设置)。
+            v2_required: 版本2「必选」区声明值(6 选 1)。空或「内容无需标注」
+                时点「内容无需标注」(必选区必须选一个)。
+            v2_optional: 版本2「可选」区声明值。空=不选。
+        """
+        # 先探测版本2 trigger「请进行内容声明（必填）」是否存在
+        # 注意:不能用 exact=True,实际 DOM 文本可能含全角括号或前后空白,
+        # 用 contains 匹配更稳。探测全程打日志,绝不静默吞异常。
+        logger.info(
+            "[内容声明] 开始探测页面 UI 版本(v2_required=%s)",
+            v2_required or "(空)",
+        )
+        v2_detected = False
+        try:
+            # 多个候选文本:全角括号 / 半角括号 / 含空白
+            v2_trigger = page.get_by_text("请进行内容声明", exact=False).first
+            cnt = await v2_trigger.count()
+            logger.info("[内容声明] 探测「请进行内容声明」count=%d", cnt)
+            if cnt > 0:
+                v2_detected = True
+        except Exception as e:
+            # 探测本身异常:打印详情,不静默吞
+            logger.warning("[内容声明] 探测版本2 trigger 异常: %s", e)
+
+        if v2_detected:
+            logger.info("[内容声明] ✓ 检测到版本2 UI(必填下拉),走 v2 逻辑")
+            try:
+                await WeiboPlatform._set_content_statement_v2(
+                    page, v2_required, v2_optional
+                )
+            except Exception as e:
+                logger.error(
+                    "[内容声明] 版本2 处理异常: %s", e, exc_info=True
+                )
+            return
+
+        # 否则走版本1(老弹窗)
+        logger.info("[内容声明] 未检测到版本2,走版本1(弹窗)逻辑")
+        try:
+            await WeiboPlatform._set_content_statement_v1(page, v1_stmt)
+        except Exception as e:
+            logger.error(
+                "[内容声明] 版本1 处理异常: %s", e, exc_info=True
+            )
+
+    @staticmethod
+    async def _set_content_statement_v1(page, statement: str):
+        """版本1:底部工具栏「内容声明」弹窗单选。
 
         spec line 7206: 5 个选项 — 无(默认)、内容为自主创作、内容为转载、
         内容由AI生成、内容为虚构演绎。
@@ -1629,6 +1891,7 @@ class WeiboPlatform(BasePlatform):
         if not statement or statement.strip() == "无":
             return
 
+        stmt_text = statement.strip()
         # trigger 是「内容声明」文本节点,click 冒泡到父级 woo-pop-ctrl
         # 但父级 <span class="woo-pop-ctrl"> 在 actionability 检查里
         # 会被判为「intercept pointer events」(2026-06-17 实测:50+ 次
@@ -1644,17 +1907,130 @@ class WeiboPlatform(BasePlatform):
         await asyncio.sleep(0.5)
 
         # 弹窗里的选项是 button,文本就是选项值
-        option = page.get_by_role("button", name=statement.strip(), exact=True).first
+        option = page.get_by_role("button", name=stmt_text, exact=True).first
         try:
             await option.wait_for(state="visible", timeout=5000)
             await option.click()
-            logger.info("[发布] 已选内容声明: %s", statement)
+            logger.info("[发布] 已选内容声明(版本1): %s", stmt_text)
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.warning(
-                "[发布] 选择内容声明失败(%s): %s", statement, e,
+                "[发布] 选择内容声明失败(%s): %s", stmt_text, e,
             )
             # ESC 关闭弹出的内容声明面板
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+
+    @staticmethod
+    async def _set_content_statement_v2(page, required_stmt: str, optional_stmt: str = ""):
+        """版本2:「请进行内容声明（必填）」下拉,分必选/可选两组。
+
+        DOM 结构(用户提供):
+          trigger: <div class="_triggerText...">请进行内容声明（必填）</div>
+          面板: <div class="_panel...">
+                   <div class="_sectionTitle">必选</div>
+                   <button>...内容无需标注 / 内容为转载 / 含AI生成内容 /
+                           含虚构演绎内容 / 个人观点，仅供参考 / 内容含营销信息</button>
+                   <div class="_sectionTitle">可选</div>
+                   <button>...内容可能引人不适... / 内容含有高危险行为... /
+                           请理性适度消费 / 未成年人请在监护人指导下浏览</button>
+                   <div class="_footer"><button>确定</button></div>
+                </div>
+
+        Args:
+            required_stmt: 必选声明值。空或「内容无需标注」时点「内容无需标注」
+                (必选区必须选一个)。
+            optional_stmt: 可选声明值。空=不选。
+        """
+        # 必选区:空或「内容无需标注」默认选「内容无需标注」(必选必填一个)
+        required_text = (required_stmt or "").strip()
+        if not required_text or required_text == "无":
+            required_text = "内容无需标注"
+
+        # 点 trigger 展开「必填」下拉(woo-pop-ctrl 同样有 intercept 问题,force)
+        # exact=False:实际文本可能含全角括号/前后空白,用包含匹配
+        trigger = page.get_by_text("请进行内容声明", exact=False).first
+        try:
+            await trigger.wait_for(state="visible", timeout=5000)
+            logger.info("[内容声明v2] 找到 trigger「请进行内容声明」")
+        except Exception as e:
+            logger.warning("[内容声明v2] 未找到 trigger 入口: %s", e)
+            return
+
+        await trigger.click(force=True)
+        logger.info("[内容声明v2] 已点击 trigger,等待面板展开")
+        # 面板展开是动画,实测 0.5s 偶尔不够,给 1s 让 _panel 完整渲染
+        await asyncio.sleep(1)
+
+        # 校验面板是否真正展开(区分"没展开"和"展开了没点到")
+        panel = page.locator("._panel_nsgmr_114, [class*='_panel_']").first
+        try:
+            await panel.wait_for(state="visible", timeout=3000)
+            logger.info("[发布] 内容声明(版本2)面板已展开")
+        except Exception as e:
+            logger.warning("[发布] 内容声明(版本2)面板未展开(trigger 点击无效?): %s", e)
+            return
+
+        # 通用:在弹出面板里点某个选项
+        # 关键:不用 get_by_role(button, name=) — 选项 button 内部是
+        # <span class="_check"><!----></span> + <span class="_optionLabel">文案</span>,
+        # accessible name 计算不稳定。改为用 CSS 类直接定位 _optionLabel 文案,
+        # 再点其父级 button。
+        async def _click_option(text, timeout=5000):
+            """点面板里文案为 text 的选项,返回是否成功。"""
+            # 定位文案 span,再点其所在 button(用 force 跳过 intercept)
+            label = page.locator(
+                f"[class*='_optionLabel']:has-text('{text}')"
+            ).first
+            try:
+                await label.wait_for(state="visible", timeout=timeout)
+                # 点 label 的父级 button(label 本身不是可点击区,button 才是)
+                btn = label.locator("xpath=ancestor::button[1]")
+                if await btn.count() == 0:
+                    # 兜底:直接点 label
+                    await label.click(force=True)
+                else:
+                    await btn.first.click(force=True)
+                return True
+            except Exception as e:
+                logger.warning("[发布] 内容声明(版本2)点击选项「%s」失败: %s", text, e)
+                return False
+
+        # 选必选项(必选区必须选一个,失败则 ESC 退出)
+        ok = await _click_option(required_text, timeout=5000)
+        if not ok:
+            logger.warning("[发布] 内容声明(版本2)必选项「%s」选择失败,放弃", required_text)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+            return
+        logger.info("[发布] 已选内容声明(版本2必选): %s", required_text)
+        await asyncio.sleep(0.4)
+
+        # 选可选项(可选,空则跳过;失败不中断,继续点确定)
+        if optional_stmt and optional_stmt.strip():
+            opt_text = optional_stmt.strip()
+            if await _click_option(opt_text, timeout=3000):
+                logger.info("[发布] 已选内容声明(版本2可选): %s", opt_text)
+                await asyncio.sleep(0.4)
+
+        # 点「确定」按钮提交选择(必点,否则选择不生效)
+        # DOM:<button class="woo-button-..."><span class="woo-button-content"> 确定 </span></button>
+        # 用 woo-button-content 文本定位,不依赖 accessible name
+        try:
+            confirm_btn = page.locator(
+                ".woo-button-content:has-text('确定')"
+            ).first
+            await confirm_btn.wait_for(state="visible", timeout=3000)
+            # 点 button(woo-button-content 的父级),force 跳过 intercept
+            confirm_button = confirm_btn.locator("xpath=ancestor::button[1]")
+            if await confirm_button.count() > 0:
+                await confirm_button.first.click(force=True)
+            else:
+                await confirm_btn.click(force=True)
+            logger.info("[发布] 内容声明(版本2)已点确定,选择提交")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning("[发布] 点内容声明(版本2)确定按钮失败: %s", e)
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.3)
 
