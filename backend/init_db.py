@@ -216,6 +216,65 @@ def init_database():
     )
     """)
 
+    # 定时图集发布 v2 —— 规则表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scheduled_publish_rules (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        zr_base_url TEXT NOT NULL DEFAULT '',
+        workflow_id TEXT NOT NULL DEFAULT '',
+        fetch_status TEXT NOT NULL DEFAULT 'success',
+        func_type TEXT NOT NULL DEFAULT '',
+        prompt TEXT NOT NULL DEFAULT '',
+        image_count INTEGER NOT NULL DEFAULT 0,
+        title_template TEXT NOT NULL DEFAULT '',
+        desc_template TEXT NOT NULL DEFAULT '',
+        tags TEXT NOT NULL DEFAULT '',
+        batch_size INTEGER NOT NULL DEFAULT 0,
+        accounts TEXT NOT NULL DEFAULT '[]',
+        extra_kwargs TEXT NOT NULL DEFAULT '{}',
+        interval_minutes INTEGER NOT NULL DEFAULT 30,
+        notify_on TEXT NOT NULL DEFAULT 'fail',
+        last_run_at TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_rules_enabled ON scheduled_publish_rules(enabled)")
+
+    # 定时图集发布 v2 —— 运行表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scheduled_publish_runs (
+        id TEXT PRIMARY KEY,
+        rule_id TEXT NOT NULL,
+        task_id TEXT NOT NULL DEFAULT '',
+        task_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'running',
+        total_images INTEGER NOT NULL DEFAULT 0,
+        success_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT,
+        error_message TEXT NOT NULL DEFAULT ''
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_runs_rule ON scheduled_publish_runs(rule_id, started_at DESC)")
+
+    # 定时图集发布 v2 —— 发布明细表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scheduled_publish_items (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        account_id INTEGER,
+        account_name TEXT NOT NULL DEFAULT '',
+        platform_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_message TEXT NOT NULL DEFAULT ''
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_items_run ON scheduled_publish_items(run_id)")
+
     conn.commit()
     conn.close()
     logger.info(f"Database initialized at {DB_PATH}")
@@ -251,6 +310,13 @@ def migrate_database():
     try:
         cursor.execute("ALTER TABLE materials ADD COLUMN orientation TEXT DEFAULT ''")
         logger.info("已添加 materials.orientation 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
+    # scheduled_publish_rules 添加 batch_size 列（每批任务数，0 = 全部候选合成一个发布内容）
+    try:
+        cursor.execute("ALTER TABLE scheduled_publish_rules ADD COLUMN batch_size INTEGER NOT NULL DEFAULT 0")
+        logger.info("已添加 scheduled_publish_rules.batch_size 列")
     except sqlite3.OperationalError:
         pass  # 列已存在
 

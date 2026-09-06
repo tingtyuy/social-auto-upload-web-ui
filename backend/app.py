@@ -175,6 +175,10 @@ from blueprints.jd_bp import bp as jd_bp  # noqa: E402
 app.register_blueprint(jd_bp)
 logger.info("[Startup] jd_picker registered OK")
 
+from blueprints.scheduled_publish_bp import scheduled_publish_bp  # noqa: E402
+app.register_blueprint(scheduled_publish_bp)
+logger.info("[Startup] scheduled_publish_bp registered OK")
+
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 logger.info(f"[Startup] Frontend dir: {FRONTEND_DIR} (exists={FRONTEND_DIR.exists()})")
 
@@ -1685,6 +1689,13 @@ if __name__ == "__main__":
         start_repair_in_background()
     except Exception as _e:
         logger.warning("[Startup] 补全任务启动失败（不影响主服务）: %s", _e)
+
+    # 定时图集发布 v2：启动后台调度线程（按规则间隔从 ZR 拉任务并多账号发布）
+    try:
+        from blueprints.scheduled_publish_bp import start_scheduler
+        start_scheduler()
+    except Exception as _e:
+        logger.warning("[Startup] 定时图集发布调度启动失败（不影响主服务）: %s", _e)
 
     # 账号登录状态检查机制:如果设置为「启动时检测」,后台异步检测所有账号 cookie
     try:
