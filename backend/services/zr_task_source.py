@@ -46,8 +46,11 @@ def _get(base_url: str, path: str, params: dict | None = None) -> dict:
 
 
 def get_task_list(base_url: str, status: str = "success", func_type: str = "",
-                  prompt: str = "", page_num: int = 1, page_size: int = 50) -> list:
-    """返回 ComfyuiTaskView 列表（camelCase 字段）。"""
+                  prompt: str = "", topic: str = "", page_num: int = 1, page_size: int = 50) -> list:
+    """返回 ComfyuiTaskView 列表（camelCase 字段）。topic 为主题精确过滤。"""
+    # QianFan 语义（success/running）→ ZR 真实状态（done/processing）映射
+    _STATUS_MAP = {"success": "done", "running": "processing"}
+    status = _STATUS_MAP.get((status or "").strip().lower(), status)
     params: dict = {"pageNum": page_num, "pageSize": page_size}
     if status:
         params["status"] = status
@@ -55,8 +58,13 @@ def get_task_list(base_url: str, status: str = "success", func_type: str = "",
         params["funcType"] = func_type
     if prompt:
         params["prompt"] = prompt
+    if topic:
+        params["topic"] = topic
     data = _unwrap(_get(base_url, "/comfyui/task/list", params), "获取任务列表")
-    return (data or {}).get("result") or []
+    result = (data or {}).get("result") or []
+    # ZR 默认按 Id 倒序（最新任务在前）；QianFan 需要按创建顺序（提示词顺序）消费，
+    # 故统一按任务 Id 升序排列，保证 single/merge 取图与主题提示词顺序一致
+    return sorted(result, key=lambda t: int(t.get("id") or 0))
 
 
 def get_task_detail(base_url: str, task_id) -> dict:

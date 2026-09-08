@@ -227,14 +227,16 @@ def init_database():
         fetch_status TEXT NOT NULL DEFAULT 'success',
         func_type TEXT NOT NULL DEFAULT '',
         prompt TEXT NOT NULL DEFAULT '',
+        zr_topic TEXT NOT NULL DEFAULT '',
         image_count INTEGER NOT NULL DEFAULT 0,
         title_template TEXT NOT NULL DEFAULT '',
         desc_template TEXT NOT NULL DEFAULT '',
         tags TEXT NOT NULL DEFAULT '',
         batch_size INTEGER NOT NULL DEFAULT 0,
+        publish_mode TEXT NOT NULL DEFAULT 'single',
         accounts TEXT NOT NULL DEFAULT '[]',
         extra_kwargs TEXT NOT NULL DEFAULT '{}',
-        interval_minutes INTEGER NOT NULL DEFAULT 30,
+        cron_expr TEXT NOT NULL DEFAULT '',
         notify_on TEXT NOT NULL DEFAULT 'fail',
         last_run_at TEXT NOT NULL DEFAULT '',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -256,7 +258,8 @@ def init_database():
         failed_count INTEGER NOT NULL DEFAULT 0,
         started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         finished_at TEXT,
-        error_message TEXT NOT NULL DEFAULT ''
+        error_message TEXT NOT NULL DEFAULT '',
+        topic TEXT NOT NULL DEFAULT ''
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_runs_rule ON scheduled_publish_runs(rule_id, started_at DESC)")
@@ -319,6 +322,45 @@ def migrate_database():
         logger.info("已添加 scheduled_publish_rules.batch_size 列")
     except sqlite3.OperationalError:
         pass  # 列已存在
+
+    # scheduled_publish_rules 添加 cron_expr 列（5 段 cron 表达式，必填）
+    try:
+        cursor.execute("ALTER TABLE scheduled_publish_rules ADD COLUMN cron_expr TEXT NOT NULL DEFAULT ''")
+        logger.info("已添加 scheduled_publish_rules.cron_expr 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
+    # scheduled_publish_rules 移除 interval_minutes 列（不再支持间隔调度，仅 cron）
+    try:
+        cursor.execute("ALTER TABLE scheduled_publish_rules DROP COLUMN interval_minutes")
+        logger.info("已移除 scheduled_publish_rules.interval_minutes 列")
+    except sqlite3.OperationalError:
+        pass  # 列不存在或已移除
+
+
+    # scheduled_publish_rules 添加 zr_topic 列（ZR 任务主题精确过滤）
+    try:
+        cursor.execute("ALTER TABLE scheduled_publish_rules ADD COLUMN zr_topic TEXT NOT NULL DEFAULT ''")
+        logger.info("已添加 scheduled_publish_rules.zr_topic 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+    # scheduled_publish_rules 添加 publish_mode 列（single=任务与账号顺序配对 / merge=多任务合并分层）
+    try:
+        cursor.execute("ALTER TABLE scheduled_publish_rules ADD COLUMN publish_mode TEXT NOT NULL DEFAULT 'single'")
+        logger.info("已添加 scheduled_publish_rules.publish_mode 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+    # scheduled_publish_runs 添加 topic 列（运行记录按主题过滤）
+    try:
+        cursor.execute("ALTER TABLE scheduled_publish_runs ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+        logger.info("已添加 scheduled_publish_runs.topic 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+    # 旧数据回填：原 batch_size != 1 的规则（>1 每批 N 个 / 0 全部候选合并）属于「多任务合并」模式
+    cursor.execute(
+        "UPDATE scheduled_publish_rules SET publish_mode='merge' "
+        "WHERE publish_mode='single' AND batch_size != 1"
+    )
 
     # 草稿批量发布用：溯源到草稿
     try:

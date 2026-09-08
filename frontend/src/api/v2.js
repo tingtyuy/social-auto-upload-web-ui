@@ -1,4 +1,4 @@
-import { http } from '@/utils/request'
+﻿import { http } from '@/utils/request'
 import request from '@/utils/request'
 
 // 任务管理
@@ -61,6 +61,13 @@ export const settingsApi = {
   },
   updateSettings(data) {
     return http.put('/api/v2/settings', data)
+  },
+  // 风控配置（发布间隔等）
+  getRiskConfig() {
+    return http.get('/api/scheduled-publish/risk-config')
+  },
+  setRiskConfig(data) {
+    return http.post('/api/scheduled-publish/risk-config', data)
   },
 }
 
