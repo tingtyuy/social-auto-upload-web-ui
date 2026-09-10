@@ -90,11 +90,8 @@
             </el-button>
           </div>
           <el-table :data="runs" v-loading="loadingRuns" empty-text="暂无运行记录">
-            <el-table-column label="任务" min-width="150">
-              <template #default="{ row }">
-                <div>{{ row.task_name || '（无任务名）' }}</div>
-                <div class="rule-sub">task_id: {{ row.task_id }}</div>
-              </template>
+            <el-table-column label="规则名称" min-width="140" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.rule_name || row.rule_id || '—' }}</template>
             </el-table-column>
             <el-table-column label="主题" min-width="110" show-overflow-tooltip>
               <template #default="{ row }">{{ row.topic || '—' }}</template>
@@ -259,6 +256,12 @@
             <el-option label="pending" value="pending" />
           </el-select>
         </el-form-item>
+        <el-form-item label="主题过滤">
+          <el-select v-model="form.zr_topic" placeholder="选择 AI 任务工厂主题（留空 = 全部任务）" clearable filterable class="full">
+            <el-option v-for="tp in zrTopicOptions" :key="tp" :label="tp" :value="tp" />
+          </el-select>
+          <span class="hint" :class="taskCountHintClass">{{ taskCountText }}</span>
+        </el-form-item>
         <el-form-item label="图片数量上限">
           <el-input-number v-model="form.image_count" :min="0" :max="50" />
           <span class="hint">每个任务最多取几张；0 = 不限制</span>
@@ -272,7 +275,7 @@
         </el-form-item>
         <el-form-item v-if="form.publish_mode === 'merge'" label="每批任务数">
           <el-input-number v-model="form.batch_size" :min="0" :max="50" />
-          <span class="hint">每批 N 个任务合成一篇；0 = 全部候选任务合并为一组</span>
+          <span class="hint">每批 N 个任务合成一篇（N ≥ 2，或 0 = 全部候选合并为一组）；候选任务/图片不足时整批跳过，不会退化为单任务</span>
         </el-form-item>
         <el-form-item label="标题模板">
           <el-input v-model="form.title_template" type="textarea" :rows="2"
@@ -333,9 +336,6 @@
             </el-form-item>
             <el-form-item label="Prompt 过滤">
               <el-input v-model="form.prompt" placeholder="按 prompt 关键字过滤（可留空）" />
-            </el-form-item>
-            <el-form-item label="主题过滤">
-              <el-input v-model="form.zr_topic" placeholder="按 AI 任务工厂主题精确过滤（可留空 = 全部）" />
             </el-form-item>
             <el-form-item label="平台附加参数">
               <el-input v-model="extraKwargsText" type="textarea" :rows="3"
@@ -422,7 +422,7 @@ const accountOptions = ref([])
 
 const emptyForm = () => ({
   id: '', name: '', enabled: true, zr_base_url: '', workflow_id: '',
-  fetch_status: 'success', func_type: '', prompt: '', zr_topic: '', image_count: 0, batch_size: 2, publish_mode: 'single',
+  fetch_status: 'success', func_type: '', prompt: '', zr_topic: '', image_count: 0, batch_size: 1, publish_mode: 'single',
   title_template: '', desc_template: '', tags: '', accounts: [], platform: 3,
   cron_expr: '', notify_on: 'fail',
 })
@@ -524,6 +524,55 @@ const itemsVisible = ref(false)
 const testingZr = ref(false)
 const testingSmtp = ref(false)
 
+// 主题过滤（从 ZR 拉取）+ 当前筛选匹配任务数实时提示
+const zrTopicOptions = ref([])
+const zrTopicLoading = ref(false)
+const taskCount = ref(null)
+const taskCountLoading = ref(false)
+const taskCountHintClass = computed(() => (taskCount.value === 0 ? 'hint-warn' : ''))
+const taskCountText = computed(() => {
+  if (!effectiveZrBaseUrl()) return '未配置 ZR 地址，请先在「全局设置」中配置'
+  if (taskCountLoading.value) return '正在统计匹配任务数…'
+  if (taskCount.value === null) return '选择主题或修改筛选后，实时显示匹配任务数'
+  return taskCount.value > 0
+    ? `当前筛选将匹配约 ${taskCount.value} 个 ZR 任务`
+    : '当前筛选下没有匹配的 ZR 任务（检查状态/主题/功能类型）'
+})
+function effectiveZrBaseUrl() {
+  return (form.value.zr_base_url || globalConfig.value.zr_base_url || '').trim()
+}
+async function loadZrTopics() {
+  const base = effectiveZrBaseUrl()
+  if (!base) { zrTopicOptions.value = []; return }
+  zrTopicLoading.value = true
+  try {
+    const res = await scheduledPublishApi.zrTopics(base)
+    zrTopicOptions.value = (res.code === 200 && Array.isArray(res.data)) ? res.data : []
+  } catch (e) { zrTopicOptions.value = [] }
+  zrTopicLoading.value = false
+}
+let countTimer = null
+async function refreshTaskCount() {
+  const base = effectiveZrBaseUrl()
+  if (!base) { taskCount.value = null; return }
+  taskCountLoading.value = true
+  try {
+    const res = await scheduledPublishApi.zrTaskCount({
+      zr_base_url: base,
+      topic: form.value.zr_topic || '',
+      status: form.value.fetch_status || '',
+      func_type: form.value.func_type || '',
+      prompt: form.value.prompt || '',
+    })
+    taskCount.value = (res.code === 200 && res.data) ? (res.data.count ?? null) : null
+  } catch (e) { taskCount.value = null }
+  taskCountLoading.value = false
+}
+// 筛选条件变化 → 防抖实时统计
+watch(() => [form.value.zr_topic, form.value.fetch_status, form.value.func_type, form.value.prompt, form.value.zr_base_url], () => {
+  clearTimeout(countTimer)
+  countTimer = setTimeout(refreshTaskCount, 500)
+})
 const activeCollapse = ref([])
 const savingSettings = ref(false)
 const DEFAULT_ZR_URL = 'http://192.168.3.8:8888'
@@ -614,17 +663,17 @@ function buildPayload() {
   return {
     name: form.value.name,
     enabled: form.value.enabled,
-    zr_base_url: form.value.zr_base_url || null,
-    workflow_id: form.value.workflow_id || null,
+    zr_base_url: form.value.zr_base_url || '',
+    workflow_id: form.value.workflow_id || '',
     fetch_status: form.value.fetch_status,
-    func_type: form.value.func_type || null,
-    prompt: form.value.prompt || null,
-    zr_topic: form.value.zr_topic || null,
+    func_type: form.value.func_type || '',
+    prompt: form.value.prompt || '',
+    zr_topic: form.value.zr_topic || '',
     image_count: form.value.image_count || 0,
     batch_size: form.value.batch_size || 0,
     publish_mode: form.value.publish_mode || 'single',
-    title_template: form.value.title_template || null,
-    desc_template: form.value.desc_template || null,
+    title_template: form.value.title_template || '',
+    desc_template: form.value.desc_template || '',
     tags: (form.value.tags || '').split(',').map(t => t.trim()).filter(Boolean),
     accounts: form.value.accounts,
     cron_expr: (form.value.cron_expr || '').trim(),
@@ -735,6 +784,8 @@ function openCreate() {
   cronPreset.value = ''
   cronPreview.value = { status: 'idle', text: '' }
   formVisible.value = true
+  loadZrTopics()
+  refreshTaskCount()
 }
 
 function openEdit(row) {
@@ -755,6 +806,8 @@ function openEdit(row) {
   cronPreset.value = ''
   refreshCronPreview()
   formVisible.value = true
+  loadZrTopics()
+  refreshTaskCount()
 }
 
 async function onSave() {
@@ -868,6 +921,7 @@ onMounted(() => {
 .rule-sub { font-size: 12px; color: #909399; }
 .mb { margin-bottom: 12px; }
 .hint { margin-left: 12px; font-size: 12px; color: #909399; }
+.hint-warn { color: #E6A23C; }
 .full { width: 100%; }
 .preview-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .preview-img { width: 96px; height: 96px; border-radius: 4px; }

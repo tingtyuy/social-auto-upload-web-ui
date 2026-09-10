@@ -39,6 +39,15 @@ export const scheduledPublishApi = {
     return http.delete(`${BASE}/runs`)
   },
 
+  // 主题/任务数（对接 ZR）
+  zrTopics(zrBaseUrl = '') {
+    return http.get(`${BASE}/zr-topics`, zrBaseUrl ? { zr_base_url: zrBaseUrl } : {})
+  },
+  zrTaskCount(params = {}) {
+    // params: { topic, status, func_type, prompt, zr_base_url }
+    return http.get(`${BASE}/zr-task-count`, params)
+  },
+
   // 预览 / 测试
   preview(ruleId) {
     return http.get(`${BASE}/preview`, { rule_id: ruleId })

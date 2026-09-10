@@ -67,6 +67,45 @@ def get_task_list(base_url: str, status: str = "success", func_type: str = "",
     return sorted(result, key=lambda t: int(t.get("id") or 0))
 
 
+def list_topics(base_url: str) -> list:
+    """从 ZR 任务列表拉取全部主题（去重、按出现顺序），供规则「主题过滤」下拉使用。"""
+    topics, seen = [], set()
+    page, size = 1, 100
+    while True:
+        data = _unwrap(_get(base_url, "/comfyui/task/list",
+                             {"pageNum": page, "pageSize": size}), "获取主题列表")
+        result = (data or {}).get("result") or []
+        for t in result:
+            tp = (t.get("topic") or "").strip()
+            if tp and tp not in seen:
+                seen.add(tp)
+                topics.append(tp)
+        total = int((data or {}).get("totalNum") or 0)
+        if page * size >= total or not result:
+            break
+        page += 1
+    return topics
+
+
+def count_tasks(base_url: str, status: str = "", func_type: str = "",
+                prompt: str = "", topic: str = "") -> int:
+    """按当前筛选条件统计 ZR 任务数量（复用 list 接口的 totalNum，pageSize=1 即足够）。
+    status 使用 QianFan 语义（success/running），内部映射为 ZR 状态。"""
+    _STATUS_MAP = {"success": "done", "running": "processing"}
+    status = _STATUS_MAP.get((status or "").strip().lower(), status)
+    params: dict = {"pageNum": 1, "pageSize": 1}
+    if status:
+        params["status"] = status
+    if func_type:
+        params["funcType"] = func_type
+    if prompt:
+        params["prompt"] = prompt
+    if topic:
+        params["topic"] = topic
+    data = _unwrap(_get(base_url, "/comfyui/task/list", params), "统计任务数")
+    return int((data or {}).get("totalNum") or 0)
+
+
 def get_task_detail(base_url: str, task_id) -> dict:
     """返回 ComfyuiTask 实体（camelCase），含 variableValues / workflowId 等。"""
     data = _unwrap(_get(base_url, f"/comfyui/task/detail/{task_id}"), f"获取任务详情 {task_id}")

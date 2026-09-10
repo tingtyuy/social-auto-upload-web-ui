@@ -387,16 +387,18 @@ def _process_batch(rule: dict, base_url: str, tasks: list, accounts: list | None
         if single_task:
             # 默认模式：一批 = 1 个任务的全部图片，各账号发布相同内容
             album = task_images[0] if task_images else []
-        else:
-            # 分层模式：第 idx 个账号取每个任务的第 idx 张图
-            album = [imgs[idx] for imgs in task_images if idx < len(imgs)]
-        if not album:
-            failed_count += 1
-            if single_task:
+            if not album:
+                failed_count += 1
                 _record_item(run_id, account, "failed", "无可用图片（任务没有图片输出）")
-            else:
+                continue
+        else:
+            # 分层模式：第 idx 个账号取每个任务的第 idx 张图；
+            # 任一任务缺该层图片 → 该账号跳过（不拼凑不完整图集）
+            if any(idx >= len(imgs) for imgs in task_images):
+                failed_count += 1
                 _record_item(run_id, account, "failed", f"图片不足（第 {idx + 1} 层无图）")
-            continue
+                continue
+            album = [imgs[idx] for imgs in task_images]
         # 风控：发布前检查（同账号/全局间隔自动等待 + 随机抖动 + 每日限额 + 失败熔断）
         try:
             allowed, waited, reason = risk_control.before_publish(account["id"])
@@ -488,8 +490,11 @@ def _run_cycle(rule: dict):
     if publish_mode == "merge":
         if batch_size >= 2:
             chunks = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
+            # 任务数不足每批数量 → 该批跳过（多任务就是多任务，不降级为单任务）
+            chunks = [c for c in chunks if len(c) >= batch_size]
         else:
-            chunks = [candidates]
+            # 0 = 全部候选合并为一组（多任务合并）；候选不足 2 个时无意义，跳过
+            chunks = [candidates] if len(candidates) >= 2 else []
         paired = False
     else:
         chunks = [[t] for t in candidates]
@@ -832,6 +837,11 @@ def _extract_rule_payload(data: dict) -> dict:
     if "publish_mode" in payload:
         pm = str(payload["publish_mode"] or "single").strip().lower()
         payload["publish_mode"] = pm if pm in ("single", "merge") else "single"
+    # SQLite NOT NULL 防御：前端空字段会传 null，显式 null 会覆盖列 DEFAULT 触发 NOT NULL 约束。
+    # 统一按列类型转回默认值（数字列 0，其余空串）。
+    for _k in list(payload.keys()):
+        if payload[_k] is None:
+            payload[_k] = 0 if _k in ("image_count", "batch_size", "enabled") else ""
     return payload
 
 
@@ -1036,27 +1046,28 @@ def list_runs():
     status = request.args.get("status") or ""
     days = request.args.get("days") or ""
     topic = request.args.get("topic") or ""
-    sql = "SELECT * FROM scheduled_publish_runs"
+    sql = ("SELECT r.*, rule.name AS rule_name FROM scheduled_publish_runs r "
+           "LEFT JOIN scheduled_publish_rules rule ON r.rule_id = rule.id")
     conds, args = [], []
     if rule_id:
-        conds.append("rule_id=?")
+        conds.append("r.rule_id=?")
         args.append(rule_id)
     if status:
-        conds.append("status=?")
+        conds.append("r.status=?")
         args.append(status)
     if topic:
-        conds.append("topic=?")
+        conds.append("r.topic=?")
         args.append(topic)
     if days:
         try:
             nd = max(1, int(days))
-            conds.append("started_at >= datetime('now', ?)")
+            conds.append("r.started_at >= datetime('now', ?)")
             args.append(f"-{nd} days")
         except (TypeError, ValueError):
             pass
     if conds:
         sql += " WHERE " + " AND ".join(conds)
-    sql += " ORDER BY started_at DESC LIMIT ?"
+    sql += " ORDER BY r.started_at DESC LIMIT ?"
     args.append(limit)
     with _get_db() as conn:
         rows = conn.execute(sql, args).fetchall()
@@ -1212,6 +1223,55 @@ def preview():
             "accounts": account_albums,
         },
     })
+
+
+@scheduled_publish_bp.route('/zr-topics', methods=['GET'])
+def zr_topics():
+    """从 ZR 任务列表拉取全部主题，供规则「主题过滤」下拉使用。",    支持 zr_base_url 参数覆盖全局设置。"""
+    base_url = (request.args.get("zr_base_url") or "").strip()
+    if not base_url:
+        try:
+            from impl.settings import read_settings
+            base_url = read_settings().get("zr_base_url") or ""
+        except Exception:
+            base_url = ""
+    if not base_url:
+        return jsonify({"code": 400, "msg": "未配置 ZR 地址，请先在「全局设置」中配置"}), 200
+    from services import zr_task_source as zr
+    try:
+        topics = zr.list_topics(base_url)
+    except Exception as e:
+        logger.error(f"[scheduled] 拉取主题列表失败: {e}")
+        return jsonify({"code": 500, "msg": f"拉取主题列表失败: {e}"}), 200
+    return jsonify({"code": 200, "msg": None, "data": topics}), 200
+
+
+@scheduled_publish_bp.route('/zr-task-count', methods=['GET'])
+def zr_task_count():
+    """按当前筛选条件（主题/状态/功能类型/Prompt）统计 ZR 任务数，
+    供规则表单实时提示「当前配置将匹配 N 个任务」。"""
+    base_url = (request.args.get("zr_base_url") or "").strip()
+    if not base_url:
+        try:
+            from impl.settings import read_settings
+            base_url = read_settings().get("zr_base_url") or ""
+        except Exception:
+            base_url = ""
+    if not base_url:
+        return jsonify({"code": 400, "msg": "未配置 ZR 地址，请先在「全局设置」中配置"}), 200
+    from services import zr_task_source as zr
+    try:
+        n = zr.count_tasks(
+            base_url,
+            status=request.args.get("status") or "",
+            func_type=request.args.get("func_type") or "",
+            prompt=request.args.get("prompt") or "",
+            topic=request.args.get("topic") or "",
+        )
+    except Exception as e:
+        logger.error(f"[scheduled] 统计任务数失败: {e}")
+        return jsonify({"code": 500, "msg": f"统计任务数失败: {e}"}), 200
+    return jsonify({"code": 200, "msg": None, "data": {"count": n}}), 200
 
 
 @scheduled_publish_bp.route('/cron/next', methods=['GET'])
