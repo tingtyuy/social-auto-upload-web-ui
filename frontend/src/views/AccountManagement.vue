@@ -100,6 +100,13 @@
                 <span class="status-dot"></span>
                 {{ account.status }}
               </span>
+              <el-tag
+                :type="account.accountType === 1 ? 'warning' : 'info'"
+                size="small"
+                :effect="account.accountType === 1 ? 'dark' : 'plain'"
+                class="account-type-tag"
+                :title="account.accountType === 1 ? '养号' : '正常号'"
+              >{{ account.accountType === 1 ? '养号' : '正常号' }}</el-tag>
             </div>
           </div>
           <div class="platform-logo">
@@ -245,6 +252,15 @@
             >
               <el-icon><Link /></el-icon>
               创作中心
+            </button>
+            <button
+              class="action-btn type-btn"
+              :class="{ 'is-raising': account.accountType === 1 }"
+              @click="toggleAccountType(account)"
+              :title="account.accountType === 1 ? '点击切换为正常号' : '点击切换为养号'"
+            >
+              <el-icon><Switch /></el-icon>
+              {{ account.accountType === 1 ? '养号' : '正常号' }}
             </button>
             <button class="action-btn delete" @click="handleDelete(account)">
               <el-icon><Delete /></el-icon>
@@ -480,7 +496,7 @@
 
 <script setup>
 import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick, h } from 'vue'
-import { Refresh, Loading, Link, Plus, Edit, Delete, Check, Folder, Key, CollectionTag, Close, Upload, SuccessFilled, CircleCheckFilled, CircleCloseFilled, Position, InfoFilled, Select, Search, Clock } from '@element-plus/icons-vue'
+import { Refresh, Loading, Link, Plus, Edit, Delete, Check, Folder, Key, CollectionTag, Close, Upload, SuccessFilled, CircleCheckFilled, CircleCloseFilled, Position, InfoFilled, Select, Search, Clock, Switch } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
@@ -948,6 +964,22 @@ const handleEdit = (row) => {
   dialogType.value = 'edit'
   Object.assign(accountForm, { id: row.id, name: row.name, platform: row.platform, status: row.status })
   dialogVisible.value = true
+}
+
+
+const toggleAccountType = async (account) => {
+  const newType = account.accountType === 1 ? 0 : 1
+  try {
+    const res = await accountApi.setAccountType(account.id, newType)
+    if (res.code === 200) {
+      account.accountType = newType
+      ElMessage.success(newType === 1 ? '已将「' + account.name + '」设为养号' : '已将「' + account.name + '」设为正常号')
+    } else {
+      ElMessage.error(res.msg || '切换失败')
+    }
+  } catch (e) {
+    ElMessage.error('切换失败: ' + (e.message || e))
+  }
 }
 
 const handleDelete = (row) => {
@@ -2066,6 +2098,22 @@ const submitAccountForm = () => {
     }
   }
 }
+.action-btn.type-btn {
+  background: #f4f4f5;
+  color: #909399;
+}
+.action-btn.type-btn:hover {
+  background: #e4e7ed;
+}
+.action-btn.type-btn.is-raising {
+  background: #fdf6ec;
+  color: #e6a23c;
+  border: 1px solid #f5dab1;
+}
+.account-type-tag {
+  margin-left: 6px;
+}
+
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }

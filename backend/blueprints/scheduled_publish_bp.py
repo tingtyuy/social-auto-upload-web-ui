@@ -101,15 +101,13 @@ def _get_accounts(account_ids) -> list:
     return accounts
 
 
-def _resolve_accounts(rule: dict) -> list:
-    """解析规则目标账号：留空时返回全部账号（按 id 稳定排序，逐一发布），否则按所选 id 取。"""
-    selected = rule.get("accounts") or []
-    if selected:
-        return _get_accounts(selected)
+def _get_accounts_by_type(account_type: int) -> list:
+    """按账号类型取全部账号：0=正常号，1=养号。"""
     with _get_db() as conn:
         rows = conn.execute(
             "SELECT id, type AS platform_id, filePath AS cookie_path, userName AS name "
-            "FROM user_info ORDER BY id"
+            "FROM user_info WHERE account_type=? ORDER BY id",
+            (account_type,),
         ).fetchall()
     return [{
         "id": row["id"],
@@ -117,6 +115,26 @@ def _resolve_accounts(rule: dict) -> list:
         "cookie_path": row["cookie_path"],
         "name": row["name"],
     } for row in rows]
+
+
+def _resolve_accounts(rule: dict) -> list:
+    """解析规则目标账号。
+
+    account_scope:
+      - all_normal （默认）: 全部正常号
+      - all_raising        : 全部养号
+      - selected           : 按 accounts（id 列表）
+    兼容旧数据：scope 为空时，选过账号按账号，否则按全部正常号。
+    """
+    scope = str(rule.get("account_scope") or "").strip().lower()
+    selected = rule.get("accounts") or []
+    if scope == "all_raising":
+        return _get_accounts_by_type(1)
+    if scope == "selected":
+        return _get_accounts(selected)
+    if selected:
+        return _get_accounts(selected)
+    return _get_accounts_by_type(0)
 
 
 # ── 核心发布逻辑 ────────────────────────────────────────────
@@ -468,6 +486,10 @@ def _run_cycle(rule: dict):
         )
     except Exception as e:
         logger.error(f"[scheduled] 规则 {rule.get('id')} 拉取任务列表失败: {e}", exc_info=True)
+        # 每次执行都留痕：拉取失败也写入运行记录，方便用户看到规则执行失败
+        run_id = str(uuid.uuid4())
+        _create_run(run_id, rule.get("id"), "", "", 0, rule.get("zr_topic") or "")
+        _finish_run(run_id, "failed", 0, 0, f"拉取 ZR 任务列表失败: {e}")
         return
 
     candidates = [
@@ -476,6 +498,11 @@ def _run_cycle(rule: dict):
     ]
     logger.info(f"[scheduled] 规则 {rule.get('id')}: 候选任务 {len(candidates)} 个")
     if not candidates:
+        # 无待发布任务也写入运行记录（状态 empty），让用户知道规则按时执行了、只是没货
+        run_id = str(uuid.uuid4())
+        _create_run(run_id, rule.get("id"), "", "", 0, rule.get("zr_topic") or "")
+        msg = "ZR 无已完成任务" if not tasks else "ZR 无待发布任务（已完成任务均已发布）"
+        _finish_run(run_id, "empty", 0, 0, msg)
         return
 
     # 发布模式：
@@ -810,7 +837,7 @@ RULE_FIELDS = (
     "name", "enabled", "zr_base_url", "workflow_id", "fetch_status", "func_type",
     "prompt", "zr_topic", "image_count", "batch_size", "publish_mode",
     "title_template", "desc_template", "tags",
-    "accounts", "extra_kwargs", "cron_expr", "notify_on",
+    "accounts", "extra_kwargs", "cron_expr", "notify_on", "account_scope",
 )
 
 
@@ -837,6 +864,9 @@ def _extract_rule_payload(data: dict) -> dict:
     if "publish_mode" in payload:
         pm = str(payload["publish_mode"] or "single").strip().lower()
         payload["publish_mode"] = pm if pm in ("single", "merge") else "single"
+    if "account_scope" in payload:
+        sc = str(payload["account_scope"] or "").strip().lower()
+        payload["account_scope"] = sc if sc in ("all_normal", "all_raising", "selected") else "all_normal"
     # SQLite NOT NULL 防御：前端空字段会传 null，显式 null 会覆盖列 DEFAULT 触发 NOT NULL 约束。
     # 统一按列类型转回默认值（数字列 0，其余空串）。
     for _k in list(payload.keys()):
@@ -975,6 +1005,7 @@ def create_rule():
     payload.setdefault("extra_kwargs", "{}")
     payload.setdefault("cron_expr", "")
     payload.setdefault("notify_on", "fail")
+    payload.setdefault("account_scope", "all_normal")
     # accounts 在 _extract_rule_payload 中已解析为 list，存库前转回 JSON 字符串
     if isinstance(payload.get("accounts"), list):
         payload["accounts"] = json.dumps(payload["accounts"], ensure_ascii=False)

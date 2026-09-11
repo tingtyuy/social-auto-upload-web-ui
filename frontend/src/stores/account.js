@@ -12,8 +12,10 @@ export const useAccountStore = defineStore('account', () => {
     // 后端 SELECT * 列顺序:id/type/filePath/userName/status/avatar/fans/likes/follows/stats,
     // 然后 row.append(tags) → tags 为最后一列。stats 是 JSON 字符串,需要解析。
     accounts.value = accountsData.map(item => {
+      // 列序：id,type,filePath,userName,status,avatar,latest_work_url,fans,likes,follows,stats,account_type
+      // getAccounts 每行末尾 append tags
       let stats = []
-      const rawStats = item[9]
+      const rawStats = item[10]
       if (typeof rawStats === 'string' && rawStats) {
         try { stats = JSON.parse(rawStats) } catch { stats = [] }
       } else if (Array.isArray(rawStats)) {
@@ -27,11 +29,12 @@ export const useAccountStore = defineStore('account', () => {
         status: item[4] === -1 ? '验证中' : (item[4] === 1 ? '正常' : '异常'),
         platform: platformIdToName[item[1]] || '未知',
         avatar: item[5] || '',
-        fans: item[6] || 0,
-        likes: item[7] || 0,
-        follows: item[8] || 0,
+        fans: item[7] || 0,
+        likes: item[8] || 0,
+        follows: item[9] || 0,
         stats,
-        tags: item[10] || item[item.length - 1] || []
+        accountType: item[11] !== undefined ? item[11] : 0,
+        tags: item[12] || item[item.length - 1] || []
       }
     })
   }

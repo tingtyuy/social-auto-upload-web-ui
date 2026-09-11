@@ -12,6 +12,7 @@ if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
 set "API_DIR=D:\wwwroot\Upload.API"
 set "WEB_DIR=D:\wwwroot\Upload.Web"
 set "TASK_NAME=QianFanSyncUploadAPI"
+set "DATA_DIR=D:\QianFanSyncData"
 
 echo.
 echo =============== QianFanSync IIS 一键发布 ===============
@@ -36,11 +37,16 @@ timeout /t 2 /nobreak >nul
 
 REM ---------- 3/5 同步后端 ----------
 echo [3/5] 同步后端代码到 %API_DIR% ...
-robocopy "%REPO%\backend" "%API_DIR%" /MIR /XD data __pycache__ .pytest_cache /NFL /NDL /NJH /NJS >nul
+robocopy "%REPO%\backend" "%API_DIR%" /MIR /XD data .venv __pycache__ .pytest_cache /NFL /NDL /NJH /NJS >nul
 if errorlevel 8 goto :fail
-if not exist "%API_DIR%\data" (
-  echo       首次复制数据目录（数据库/cookies/上传文件）...
-  robocopy "%REPO%\data" "%API_DIR%\data" /E /NFL /NDL /NJH /NJS >nul
+if not exist "%DATA_DIR%\db\database.db" (
+  echo       首次初始化数据目录（数据库/cookies）...
+  robocopy "%REPO%\data" "%DATA_DIR%" /E /NFL /NDL /NJH /NJS >nul
+  if errorlevel 8 goto :fail
+)
+if not exist "%API_DIR%\.venv\Scripts\python.exe" (
+  echo       首次复制 Python 虚拟环境（约 300MB，仅首次）...
+  robocopy "%REPO%\backend\.venv" "%API_DIR%\.venv" /E /NFL /NDL /NJH /NJS >nul
   if errorlevel 8 goto :fail
 )
 if not exist "%API_DIR%\cloakbrowser\chrome.exe" (
@@ -54,9 +60,10 @@ REM 生成运行时启动脚本
 >> "%API_DIR%\run_api.bat" echo cd /d %API_DIR%
 >> "%API_DIR%\run_api.bat" echo set "PATH=%REPO%\dependency\bin;%PATH%"
 >> "%API_DIR%\run_api.bat" echo set "SAU_PORT=%API_INTERNAL_PORT%"
->> "%API_DIR%\run_api.bat" echo set "SAU_DATA_DIR=%API_DIR%\data"
+>> "%API_DIR%\run_api.bat" echo set "SAU_DATA_DIR=%DATA_DIR%"
 >> "%API_DIR%\run_api.bat" echo set "CLOAKBROWSER_BINARY_PATH=%API_DIR%\cloakbrowser\chrome.exe"
->> "%API_DIR%\run_api.bat" echo .venv\Scripts\python.exe app.py
+>> "%API_DIR%\run_api.bat" echo start "QianFanSync-6605" /b .venv\Scripts\pythonw.exe app.py
+>> "%API_DIR%\run_api.bat" echo exit /b 0
 
 REM 生成 IIS 反向代理配置
 > "%API_DIR%\web.config" echo ^<?xml version="1.0" encoding="UTF-8"?^>
@@ -78,7 +85,7 @@ REM 生成 IIS 反向代理配置
 
 REM ---------- 4/5 IIS 站点 + 计划任务 + 启动 ----------
 echo [4/5] 配置 IIS 站点与计划任务...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ac = 'C:\Windows\System32\inetsrv\appcmd.exe'; if (-not (Test-Path '%WEB_DIR%')) { New-Item -ItemType Directory -Path '%WEB_DIR%' -Force | Out-Null }; if (-not (Test-Path '%API_DIR%')) { New-Item -ItemType Directory -Path '%API_DIR%' -Force | Out-Null }; & $ac add apppool 'Upload.Web' 2>$null | Out-Null; & $ac set apppool 'Upload.Web' /autoStart:true | Out-Null; & $ac add apppool 'Upload.API' 2>$null | Out-Null; & $ac set apppool 'Upload.API' /autoStart:true | Out-Null; & $ac add site /name:'Upload.Web' /bindings:'http://*:%WEB_PORT%' /physicalPath:'%WEB_DIR%' 2>$null | Out-Null; & $ac set site 'Upload.Web' /bindings:'http://*:%WEB_PORT%' | Out-Null; & $ac set app 'Upload.Web/' /applicationPool:'Upload.Web' | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'appcmd Upload.Web failed' }; & $ac add site /name:'Upload.API' /bindings:'http://*:%API_PORT%' /physicalPath:'%API_DIR%' 2>$null | Out-Null; & $ac set site 'Upload.API' /bindings:'http://*:%API_PORT%' | Out-Null; & $ac set app 'Upload.API/' /applicationPool:'Upload.API' | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'appcmd Upload.API failed' }; $action = New-ScheduledTaskAction -Execute '%API_DIR%\run_api.bat'; $trigger = New-ScheduledTaskTrigger -AtStartup; $principal = New-ScheduledTaskPrincipal -UserId ($env:USERDOMAIN + '\' + $env:USERNAME) -LogonType S4U -RunLevel Limited; $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; try { Write-Output ('UID-DEBUG=[' + $principal.UserId + ']'); Register-ScheduledTask -TaskName '%TASK_NAME%' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null; $ex = Export-ScheduledTask -TaskName '%TASK_NAME%'; $xx = if ($ex -is [string]) { $ex } else { $ex.Xml }; if (-not $xx) { throw 'export empty' }; $xx = $xx -replace '<ExecutionTimeLimit>[^<]*</ExecutionTimeLimit>', '<ExecutionTimeLimit>PT0H</ExecutionTimeLimit>'; if ($xx -notmatch '<ExecutionTimeLimit>') { $xx = $xx -replace '<Settings>', '<Settings><ExecutionTimeLimit>PT0H</ExecutionTimeLimit>' }; Register-ScheduledTask -TaskName '%TASK_NAME%' -Xml $xx -Force | Out-Null; Stop-ScheduledTask -TaskName '%TASK_NAME%' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName '%TASK_NAME%'; $chk = Export-ScheduledTask -TaskName '%TASK_NAME%'; $cx = if ($chk -is [string]) { $chk } else { $chk.Xml }; if ($cx -notmatch '<ExecutionTimeLimit>PT0[HS]</ExecutionTimeLimit>') { throw 'ExecutionTimeLimit PT0 not applied' }; } catch { throw ('task setup failed: ' + $_.Exception.Message) }; Write-Output 'IIS 站点与计划任务就绪'" || goto :fail
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ac = 'C:\Windows\System32\inetsrv\appcmd.exe'; if (-not (Test-Path '%WEB_DIR%')) { New-Item -ItemType Directory -Path '%WEB_DIR%' -Force | Out-Null }; if (-not (Test-Path '%API_DIR%')) { New-Item -ItemType Directory -Path '%API_DIR%' -Force | Out-Null }; & $ac add apppool 'Upload.Web' 2>$null | Out-Null; & $ac set apppool 'Upload.Web' /autoStart:true | Out-Null; & $ac add apppool 'Upload.API' 2>$null | Out-Null; & $ac set apppool 'Upload.API' /autoStart:true | Out-Null; & $ac add site /name:'Upload.Web' /bindings:'http://*:%WEB_PORT%' /physicalPath:'%WEB_DIR%' 2>$null | Out-Null; & $ac set site 'Upload.Web' /bindings:'http://*:%WEB_PORT%' | Out-Null; & $ac set app 'Upload.Web/' /applicationPool:'Upload.Web' | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'appcmd Upload.Web failed' }; & $ac add site /name:'Upload.API' /bindings:'http://*:%API_PORT%' /physicalPath:'%API_DIR%' 2>$null | Out-Null; & $ac set site 'Upload.API' /bindings:'http://*:%API_PORT%' | Out-Null; & $ac set app 'Upload.API/' /applicationPool:'Upload.API' | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'appcmd Upload.API failed' }; $action = New-ScheduledTaskAction -Execute '%API_DIR%\run_api.bat'; $trigger = New-ScheduledTaskTrigger -AtLogOn -User ($env:USERDOMAIN + '\' + $env:USERNAME); $principal = New-ScheduledTaskPrincipal -UserId ($env:USERDOMAIN + '\' + $env:USERNAME) -LogonType Interactive -RunLevel Limited; $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; try { Write-Output ('UID-DEBUG=[' + $principal.UserId + ']'); Register-ScheduledTask -TaskName '%TASK_NAME%' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null; $ex = Export-ScheduledTask -TaskName '%TASK_NAME%'; $xx = if ($ex -is [string]) { $ex } else { $ex.Xml }; if (-not $xx) { throw 'export empty' }; $xx = $xx -replace '<ExecutionTimeLimit>[^<]*</ExecutionTimeLimit>', '<ExecutionTimeLimit>PT0H</ExecutionTimeLimit>'; if ($xx -notmatch '<ExecutionTimeLimit>') { $xx = $xx -replace '<Settings>', '<Settings><ExecutionTimeLimit>PT0H</ExecutionTimeLimit>' }; Register-ScheduledTask -TaskName '%TASK_NAME%' -Xml $xx -Force | Out-Null; Stop-ScheduledTask -TaskName '%TASK_NAME%' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName '%TASK_NAME%'; $chk = Export-ScheduledTask -TaskName '%TASK_NAME%'; $cx = if ($chk -is [string]) { $chk } else { $chk.Xml }; if ($cx -notmatch '<ExecutionTimeLimit>PT0[HS]</ExecutionTimeLimit>') { throw 'ExecutionTimeLimit PT0 not applied' }; } catch { throw ('task setup failed: ' + $_.Exception.Message) }; Write-Output 'IIS 站点与计划任务就绪'" || goto :fail
 
 REM ---------- 5/5 同步前端 dist + 健康检查 ----------
 echo [5/5] 同步前端 dist 到 %WEB_DIR% ...

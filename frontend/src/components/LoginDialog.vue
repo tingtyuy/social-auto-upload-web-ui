@@ -186,7 +186,27 @@ function startLogin(platformKey, accountId = null) {
   const es = new EventSource(url)
   eventSources.set(platformKey, es)
 
+  // 登录超时兜底：SSE 连接成功但 40s 内无任何事件（常见于后端运行在 Session 0 无法弹浏览器），
+  // 主动置为失败并给出可排查提示，避免卡片一直停留在登录中...
+  let lastEventAt = Date.now()
+  const timeoutTimer = setInterval(() => {
+    const state = cardStates[platformKey]?.status
+    if (state === 'success' || state === 'fail') { clearInterval(timeoutTimer); return }
+    if (Date.now() - lastEventAt > 40000) {
+      clearInterval(timeoutTimer)
+      const errMsg = '登录超时：浏览器窗口未弹出。若为 IIS 部署，请确认后端运行在用户会话（Session 0 无法打开浏览器），见 deploy/install_iis_task.ps1'
+      setCardStatus(platformKey, 'fail', errMsg)
+      closeSSE(platformKey)
+      if (props.mode === 'relogin' && reloginKey.value === platformKey) {
+        reloginStatus.value = 'fail'
+        reloginErrMsg.value = errMsg
+      }
+      emit('fail', { platform: platformKey, errMsg })
+    }
+  }, 5000)
+
   es.onmessage = (event) => {
+    lastEventAt = Date.now()
     let result
     try {
       result = JSON.parse(event.data)

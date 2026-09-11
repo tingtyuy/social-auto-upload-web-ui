@@ -39,6 +39,41 @@ from util._logger import get_channel_logger
 logger = get_channel_logger("backend")
 
 
+def _current_session_id():
+    """返回当前进程的 Windows 会话 ID（Session 0 = 服务/非交互会话，无法弹出浏览器窗口）。
+
+    - 会话 0：计划任务"不管用户是否登录都运行"、Windows 服务等启动方式 → 无桌面 → CloakBrowser 不可用
+    - 非 0（如 1/2/7...）：用户交互会话，浏览器登录正常
+    非 Windows 环境返回 None（视为交互环境，不做限制）。
+    """
+    try:
+        import ctypes
+
+        pid = ctypes.windll.kernel32.GetCurrentProcessId()
+        sid = ctypes.c_ulong()
+        if ctypes.windll.kernel32.ProcessIdToSessionId(pid, ctypes.byref(sid)):
+            return int(sid.value)
+    except Exception:
+        pass
+    return None
+
+
+def _is_non_interactive_session():
+    """是否运行在无桌面交互的会话（Session 0）。"""
+    sid = _current_session_id()
+    return sid is not None and sid == 0
+
+
+def _interactive_session_warning():
+    """给非交互会话启动的明确警告文案，方便部署排查。"""
+    return (
+        "当前后端运行在 Session 0（非交互会话），无法打开浏览器窗口，"
+        "「添加账号 / 登录 / 发布」等浏览器自动化功能将不可用。"
+        "请改用交互式方式启动（用户登录会话），参见 deploy/install_iis_task.ps1 或 deploy/run_api.bat。"
+    )
+
+
+
 def _ensure_materials_table():
     """服务启动时确保 materials 表存在"""
     DB_PATH = BASE_DIR / "db" / "database.db"
@@ -457,6 +492,22 @@ def set_account_tags(account_id):
         return jsonify({"code": 500, "msg": str(e)}), 500
 
 
+@app.route('/api/accounts/<int:account_id>/type', methods=['PUT'])
+def set_account_type(account_id):
+    """切换账号类型：0=正常号（默认），1=养号"""
+    data = request.get_json() or {}
+    account_type = 1 if data.get('account_type') else 0
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cur = conn.execute('UPDATE user_info SET account_type=? WHERE id=?', (account_type, account_id))
+            if cur.rowcount == 0:
+                return jsonify({"code": 404, "msg": "账号不存在"}), 404
+            conn.commit()
+        return jsonify({"code": 200, "msg": None, "data": {"id": account_id, "account_type": account_type}})
+    except Exception as e:
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
 @app.route('/api/accounts/batch/tags', methods=['PUT'])
 def set_batch_account_tags():
     """批量为多个账号添加相同的标签(追加模式:不清除已有标签)"""
@@ -684,6 +735,23 @@ def login():
     platform = get_platform(int(type_str))
     if not platform:
         return jsonify({"code": 400, "msg": "不支持的平台类型"}), 400
+
+    # 非交互会话（Session 0）无法弹出浏览器窗口，直接推送明确错误，避免前端一直"登录中"
+    if _is_non_interactive_session():
+        logger.error(f"[login] {platform.platform_name} 登录被拒绝：{_interactive_session_warning()}")
+        err_msg = (
+            "后端运行在非交互会话（Session 0），无法打开浏览器窗口完成登录。"
+            "请用交互式方式重启后端（见 deploy/install_iis_task.ps1），或在桌面会话运行后重试。"
+        )
+
+        def _err_stream():
+            yield f"data: {json.dumps({'status': '500', 'msg': err_msg})}\n\n"
+
+        response = Response(_err_stream(), mimetype='text/event-stream')
+        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['X-Accel-Buffering'] = 'no'
+        response.headers['Content-Type'] = 'text/event-stream'
+        return response
 
     status_queue = Queue()
     active_queues[id_str] = status_queue
@@ -1663,6 +1731,11 @@ def find_available_port(start_port=5409, max_attempts=10):
 
 if __name__ == "__main__":
     import socket
+
+    if _is_non_interactive_session():
+        logger.warning("[Startup] " + _interactive_session_warning())
+    else:
+        logger.info(f"[Startup] 当前会话 ID={_current_session_id()}（交互会话，浏览器自动化可用）")
 
     logger.info("[Startup] Initializing database...")
     from init_db import init_database, migrate_database

@@ -293,10 +293,26 @@
             <el-option v-for="p in platformOptions" :key="String(p.value)" :label="p.label" :value="p.value" />
           </el-select>
         </el-form-item>
-        <el-form-item label="目标账号">
-          <el-select v-model="form.accounts" multiple filterable placeholder="选择要发布的账号（留空 = 全部账号逐一发布）" class="full">
+        <el-form-item label="目标账号" required>
+          <el-radio-group v-model="form.account_scope" class="full">
+            <el-radio value="all_normal">全部正常号</el-radio>
+            <el-radio value="all_raising">全部养号</el-radio>
+            <el-radio value="selected">指定账号</el-radio>
+          </el-radio-group>
+          <el-select
+            v-if="form.account_scope === 'selected'"
+            v-model="form.accounts"
+            multiple
+            filterable
+            :filter-method="accountFilter"
+            placeholder="输入账号名或拼音搜索，可多选"
+            class="full mt8"
+          >
             <el-option v-for="acc in filteredAccountOptions" :key="acc.id" :label="acc.label" :value="acc.id" />
           </el-select>
+          <div class="cron-meta">
+            <span class="cron-hint">{{ scopeAccountHint }}</span>
+          </div>
         </el-form-item>
         <el-form-item label="执行计划" required>
           <div class="cron-row">
@@ -405,6 +421,7 @@ import { scheduledPublishApi } from '@/api/scheduledPublish'
 import { accountApi } from '@/api/account'
 import { settingsApi } from '@/api/v2'
 import { platformIdToName, platformList } from '@/config/platforms'
+import { pinyin } from 'pinyin-pro'
 
 const activeTab = ref('rules')
 
@@ -424,7 +441,7 @@ const emptyForm = () => ({
   id: '', name: '', enabled: true, zr_base_url: '', workflow_id: '',
   fetch_status: 'success', func_type: '', prompt: '', zr_topic: '', image_count: 0, batch_size: 1, publish_mode: 'single',
   title_template: '', desc_template: '', tags: '', accounts: [], platform: 3,
-  cron_expr: '', notify_on: 'fail',
+  cron_expr: '', notify_on: 'fail', account_scope: 'all_normal',
 })
 
 const form = ref(emptyForm())
@@ -649,10 +666,10 @@ async function onSaveSettings() {
 }
 
 function statusText(s) {
-  return { success: '成功', failed: '失败', partial: '部分成功', running: '运行中', pending: '待处理' }[s] || s
+  return { success: '成功', failed: '失败', partial: '部分成功', running: '运行中', pending: '待处理', empty: '无任务' }[s] || s
 }
 function statusTag(s) {
-  return { success: 'success', failed: 'danger', partial: 'warning', running: 'info', pending: 'info' }[s] || 'info'
+  return { success: 'success', failed: 'danger', partial: 'warning', running: 'info', pending: 'info', empty: 'info' }[s] || 'info'
 }
 
 function buildPayload() {
@@ -676,6 +693,7 @@ function buildPayload() {
     desc_template: form.value.desc_template || '',
     tags: (form.value.tags || '').split(',').map(t => t.trim()).filter(Boolean),
     accounts: form.value.accounts,
+    account_scope: form.value.account_scope || 'all_normal',
     cron_expr: (form.value.cron_expr || '').trim(),
     notify_on: form.value.notify_on,
     extra_kwargs: extra,
@@ -765,18 +783,53 @@ async function loadAccounts() {
     const res = await accountApi.getAccounts()
     const list = res.data || []
     accountOptions.value = list.map(a => {
-      // /getAccounts 返回的是「位置数组」：[id, type, filePath, userName, status, ...]
+      // /getAccounts 返回的是「位置数组」：[id, type, filePath, userName, status, ..., account_type, tags]
       const id = Array.isArray(a) ? a[0] : a.id
       const type = Array.isArray(a) ? a[1] : a.type
       const userName = Array.isArray(a) ? a[3] : (a.userName || a.name)
+      const name = String(userName || id)
+      let py = '', pyFirst = ''
+      try {
+        py = pinyin(name, { toneType: 'none', type: 'array' }).join('').toLowerCase()
+        pyFirst = pinyin(name, { pattern: 'first', toneType: 'none', type: 'array' }).join('').toLowerCase()
+      } catch (e) { /* 拼音失败不阻塞 */ }
       return {
         id,
         platform: type,
-        label: `${userName || id}（${platformIdToName[type] || type}）`,
+        name,
+        accountType: Array.isArray(a) ? (a[11] || 0) : (a.accountType || 0),
+        py,
+        pyFirst,
+        label: `${name}（${platformIdToName[type] || type}）`,
       }
     })
   } catch (e) { /* ignore */ }
 }
+
+
+function accountFilter(query, option) {
+  if (!query) return true
+  const q = String(query).trim().toLowerCase()
+  if (!q) return true
+  const a = accountOptions.value.find(x => x.id === option.value)
+  if (!a) return true
+  return (a.label || '').toLowerCase().includes(q)
+    || (a.py || '').includes(q)
+    || (a.pyFirst || '').includes(q)
+    || String(a.id).includes(q)
+}
+
+const scopeAccountHint = computed(() => {
+  const list = accountOptions.value
+  const scope = form.value.account_scope
+  if (scope === 'all_raising') {
+    return `当前有 ${list.filter(a => a.accountType === 1).length} 个养号账号将参与发布`
+  }
+  if (scope === 'selected') {
+    return form.value.accounts.length ? `已选择 ${form.value.accounts.length} 个账号` : '请从下方选择要发布的账号（可多选）'
+  }
+  return `当前有 ${list.filter(a => !a.accountType).length} 个正常号账号将参与发布`
+})
 
 function openCreate() {
   form.value = emptyForm()
@@ -800,6 +853,7 @@ function openEdit(row) {
     publish_mode: row.publish_mode || (row.batch_size > 1 ? 'merge' : 'single'),
     platform,
     tags: (row.tags || []).join(', '),
+    account_scope: row.account_scope || (accs.length ? 'selected' : 'all_normal'),
     accounts: accs,
   }
   extraKwargsText.value = JSON.stringify(row.extra_kwargs || {})

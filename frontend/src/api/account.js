@@ -59,6 +59,10 @@ export const accountApi = {
   getAccountTags(accountId) {
     return http.get(`/api/accounts/${accountId}/tags`)
   },
+  // 切换账号类型：0=正常号，1=养号
+  setAccountType(accountId, accountType) {
+    return http.put(`/api/accounts/${accountId}/type`, { account_type: accountType })
+  },
 
   // ── cookie 字符串导入账号 ──
 

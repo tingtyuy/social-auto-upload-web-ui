@@ -38,6 +38,9 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5173 ^| findstr LISTENING 2^
 for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5410 ^| findstr LISTENING 2^>nul') do taskkill /F /PID %%a >nul 2>&1
 echo OK ports cleared
 
+:: --- 数据目录：独立位置，本机本地与 IIS 共用（可配置） ---
+set "SAU_DATA_DIR=D:\QianFanSyncData"
+
 :: --- Backend venv ---
 set "VENV_DIR=%BACKEND_DIR%\.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"

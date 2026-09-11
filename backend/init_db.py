@@ -19,6 +19,7 @@ def init_database():
         (BASE_DIR / subdir).mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(DB_PATH))
+    conn.execute('PRAGMA journal_mode=WAL')  # WAL：本地/IIS 双进程共库时减少写锁冲突
     cursor = conn.cursor()
 
     # 原始表
@@ -286,12 +287,27 @@ def init_database():
 def migrate_database():
     """增量迁移 — 添加新列（幂等）"""
     conn = sqlite3.connect(str(DB_PATH))
+    conn.execute('PRAGMA journal_mode=WAL')  # WAL：本地/IIS 双进程共库时减少写锁冲突
     cursor = conn.cursor()
 
     # user_info 添加 avatar 列
     try:
         cursor.execute('ALTER TABLE user_info ADD COLUMN avatar TEXT DEFAULT ""')
         logger.info("已添加 avatar 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
+    # user_info 添加 account_type 列（0=正常号 默认，1=养号）
+    try:
+        cursor.execute('ALTER TABLE user_info ADD COLUMN account_type INTEGER NOT NULL DEFAULT 0')
+        logger.info("已添加 user_info.account_type 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
+    # scheduled_publish_rules 添加 account_scope 列（目标账号：all_normal/all_raising/selected）
+    try:
+        cursor.execute('ALTER TABLE scheduled_publish_rules ADD COLUMN account_scope TEXT DEFAULT "all_normal"')
+        logger.info("已添加 scheduled_publish_rules.account_scope 列")
     except sqlite3.OperationalError:
         pass  # 列已存在
 
